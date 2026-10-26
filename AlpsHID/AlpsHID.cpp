@@ -191,35 +191,68 @@ bool AlpsHIDEventDriver::handleStart(IOService* provider) {
 }
 
 
-IOReturn AlpsHIDEventDriver::setPowerState(unsigned long whichState, IOService* whatDevice) {
+IOReturn AlpsHIDEventDriver::setPowerState(
+    unsigned long whichState,
+    IOService* whatDevice
+) {
     if (whatDevice != this)
         return kIOReturnInvalid;
+
     if (!whichState) {
-        if (awake)
-            awake = false;
-        IOLog("%s::%s Going to sleep\n", getName(), name);
-    } else {
-        if (!awake) {
-            IOSleep(10);
-            
-            IOLog("%s::%s Awake, putting device in precision mode\n", getName(), name);
-            switch(dev_type){
+        awake = false;
+        ready = false;
+
+        IOLog("%s::%s Going to sleep\n",
+              getName(), name ? name : "unknown");
+
+        return kIOPMAckImplied;
+    }
+
+    if (!awake) {
+        bool initialized = false;
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            // Allow the I2C controller to recover after wake.
+            IOSleep(attempt == 0 ? 10 : 50);
+
+            switch (dev_type) {
                 case T4:
                     t4_device_init();
+                    initialized = ready;
                     break;
+
                 case U1:
-                    u1_device_init();
+                    initialized = u1_device_init();
+                    break;
+
+                default:
+                    initialized = false;
                     break;
             }
-            
-            
-            
-            awake = true;
+
+            if (initialized) {
+                IOLog("%s::%s Wake initialization succeeded "
+                      "(attempt %d/3)\n",
+                      getName(), name ? name : "unknown",
+                      attempt + 1);
+                break;
+            }
+
+            IOLog("%s::%s Wake initialization failed "
+                  "(attempt %d/3)\n",
+                  getName(), name ? name : "unknown",
+                  attempt + 1);
         }
+
+        // Do not mark the device as awake if initialization failed.
+        awake = initialized;
+
+        if (!initialized)
+            ready = false;
     }
+
     return kIOPMAckImplied;
 }
-
 
 UInt16 AlpsHIDEventDriver::t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length)
 {
@@ -504,118 +537,177 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
 }
 
 bool AlpsHIDEventDriver::u1_device_init() {
-    
     ready = false;
-    
-    UInt8 tmp, dev_ctrl, sen_line_num_x, sen_line_num_y;
-    UInt8 pitch_x, pitch_y, resolution;
-    alps_dev pri_data;
+
+    UInt8 tmp = 0;
+    UInt8 dev_ctrl = 0;
+    UInt8 sen_line_num_x = 0;
+    UInt8 sen_line_num_y = 0;
+    UInt8 pitch_x = 0;
+    UInt8 pitch_y = 0;
+    UInt8 resolution = 0;
+
+    alps_dev pri_data = {};
     IOReturn ret = kIOReturnSuccess;
-    
-    /* Device initialization */
-    ret = u1_read_write_register(ADDRESS_U1_DEV_CTRL_1, &dev_ctrl, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not read device mode\n", getName(), name);
+
+    if (!hid_interface)
+        return false;
+
+    // Read device control register.
+    ret = u1_read_write_register(
+        ADDRESS_U1_DEV_CTRL_1, &dev_ctrl, 0, true);
+    if (ret != kIOReturnSuccess)
         goto exit;
-    }
-    
+
     dev_ctrl &= ~U1_DISABLE_DEV;
     dev_ctrl |= U1_TP_ABS_MODE;
-    
-    u1_read_write_register(ADDRESS_U1_DEV_CTRL_1, NULL, dev_ctrl, false);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not put device in absolute mode\n", getName(), name);
+
+    ret = u1_read_write_register(
+        ADDRESS_U1_DEV_CTRL_1, NULL, dev_ctrl, false);
+    if (ret != kIOReturnSuccess)
+        goto exit;
+
+    // Read sensor geometry.
+    ret = u1_read_write_register(
+        ADDRESS_U1_NUM_SENS_X, &sen_line_num_x, 0, true);
+    if (ret != kIOReturnSuccess)
+        goto exit;
+
+    ret = u1_read_write_register(
+        ADDRESS_U1_NUM_SENS_Y, &sen_line_num_y, 0, true);
+    if (ret != kIOReturnSuccess)
+        goto exit;
+
+    ret = u1_read_write_register(
+        ADDRESS_U1_PITCH_SENS_X, &pitch_x, 0, true);
+    if (ret != kIOReturnSuccess)
+        goto exit;
+
+    ret = u1_read_write_register(
+        ADDRESS_U1_PITCH_SENS_Y, &pitch_y, 0, true);
+    if (ret != kIOReturnSuccess)
+        goto exit;
+
+    ret = u1_read_write_register(
+        ADDRESS_U1_RESO_DWN_ABS, &resolution, 0, true);
+    if (ret != kIOReturnSuccess)
+        goto exit;
+
+    // Reject invalid geometry before calculating coordinate ranges.
+    if (sen_line_num_x < 2 ||
+        sen_line_num_y < 2 ||
+        pitch_x == 0 ||
+        pitch_y == 0 ||
+        resolution == 0) {
+        IOLog(
+            "%s::%s Invalid U1 geometry: "
+            "sensors=%u,%u pitch=%u,%u resolution=%u\n",
+            getName(), name,
+            sen_line_num_x, sen_line_num_y,
+            pitch_x, pitch_y, resolution);
+
+        ret = kIOReturnError;
         goto exit;
     }
 
-    u1_read_write_register(ADDRESS_U1_NUM_SENS_X, &sen_line_num_x, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not read sen_line_num_x\n", getName(), name);
-        goto exit;
-    }
-    
-    u1_read_write_register(ADDRESS_U1_NUM_SENS_Y, &sen_line_num_y, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not read sen_line_num_y\n", getName(), name);
-        goto exit;
-    }
-    
-    u1_read_write_register(ADDRESS_U1_PITCH_SENS_X, &pitch_x, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not read pitch_sens_x\n", getName(), name);
-        goto exit;
-    }
-    
-    u1_read_write_register(ADDRESS_U1_PITCH_SENS_Y, &pitch_y, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not read pitch_sens_y\n", getName(), name);
-        goto exit;
-    }
-    
-    u1_read_write_register(ADDRESS_U1_RESO_DWN_ABS, &resolution, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not read absolute mode resolution\n", getName(), name);
-        goto exit;
-    }
-    
-    pri_data.x_active_len_mm = (pitch_x * (sen_line_num_x - 1));
-    pri_data.y_active_len_mm = (pitch_y * (sen_line_num_y - 1));
-    
-    pri_data.x_max = (resolution << 2) * (sen_line_num_x - 1);
+    pri_data.x_active_len_mm =
+        pitch_x * (sen_line_num_x - 1);
+
+    pri_data.y_active_len_mm =
+        pitch_y * (sen_line_num_y - 1);
+
+    pri_data.x_max =
+        (resolution << 2) * (sen_line_num_x - 1);
     pri_data.x_min = 1;
-    pri_data.y_max = (resolution << 2) * (sen_line_num_y - 1);
+
+    pri_data.y_max =
+        (resolution << 2) * (sen_line_num_y - 1);
     pri_data.y_min = 1;
-    
-    u1_read_write_register(ADDRESS_U1_PAD_BTN, &tmp, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not read button count\n", getName(), name);
+
+    // Read button configuration.
+    ret = u1_read_write_register(
+        ADDRESS_U1_PAD_BTN, &tmp, 0, true);
+    if (ret != kIOReturnSuccess)
         goto exit;
+
+    if ((tmp & 0x0F) == ((tmp & 0xF0) >> 4))
+        pri_data.btn_cnt = tmp & 0x0F;
+    else
+        pri_data.btn_cnt = 1;
+
+    // Detect optional trackpoint support.
+    ret = u1_read_write_register(
+        ADDRESS_U1_DEVICE_TYP, &tmp, 0, true);
+    if (ret != kIOReturnSuccess)
+        goto exit;
+
+    if (tmp & U1_DEVTYPE_SP_SUPPORT) {
+        dev_ctrl |= U1_SP_ABS_MODE;
+
+        ret = u1_read_write_register(
+            ADDRESS_U1_DEV_CTRL_1, NULL, dev_ctrl, false);
+
+        if (ret == kIOReturnSuccess) {
+            ret = u1_read_write_register(
+                ADDRESS_U1_SP_BTN,
+                &pri_data.sp_btn_info, 0, true);
+        }
+
+        if (ret == kIOReturnSuccess) {
+            pri_data.has_sp = 1;
+        } else {
+            // Trackpoint initialization is optional.
+            IOLog(
+                "%s::%s Trackpoint initialization failed: %d\n",
+                getName(), name, ret);
+
+            pri_data.has_sp = 0;
+        }
     }
 
-    if ((tmp & 0x0F) == (tmp & 0xF0) >> 4) {
-        pri_data.btn_cnt = (tmp & 0x0F);
-    } else {
-        /* Button pad */
-        pri_data.btn_cnt = 1;
-    }
-    
-    u1_read_write_register(ADDRESS_U1_DEVICE_TYP, &tmp, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("%s::%s Could not read button count\n", getName(), name);
-        goto exit;
-    }
-    if(tmp & U1_DEVTYPE_SP_SUPPORT)
-    {
-        dev_ctrl |= U1_SP_ABS_MODE;
-        u1_read_write_register(ADDRESS_U1_DEV_CTRL_1, 0, dev_ctrl, false);
-        u1_read_write_register(ADDRESS_U1_SP_BTN, &pri_data.sp_btn_info, 0, true);
-        pri_data.has_sp = 1;
-    }
-    
-    setProperty(VOODOO_INPUT_LOGICAL_MAX_X_KEY, pri_data.x_max, 32);
-    setProperty(VOODOO_INPUT_LOGICAL_MAX_Y_KEY, pri_data.y_max, 32);
-       
-    setProperty(VOODOO_INPUT_PHYSICAL_MAX_X_KEY, pri_data.x_active_len_mm * 10, 32);
-    setProperty(VOODOO_INPUT_PHYSICAL_MAX_Y_KEY, pri_data.y_active_len_mm * 10, 32);
+    setProperty(
+        VOODOO_INPUT_LOGICAL_MAX_X_KEY,
+        pri_data.x_max, 32);
+
+    setProperty(
+        VOODOO_INPUT_LOGICAL_MAX_Y_KEY,
+        pri_data.y_max, 32);
+
+    setProperty(
+        VOODOO_INPUT_PHYSICAL_MAX_X_KEY,
+        pri_data.x_active_len_mm * 10, 32);
+
+    setProperty(
+        VOODOO_INPUT_PHYSICAL_MAX_Y_KEY,
+        pri_data.y_active_len_mm * 10, 32);
 
     ready = true;
     return true;
-    
+
 exit:
+    IOLog(
+        "%s::%s U1 initialization failed: %d\n",
+        getName(), name, ret);
+
     ready = false;
     return false;
-    
 }
 
-IOReturn AlpsHIDEventDriver::u1_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag) {
-    
-    UInt8 check_sum;
+IOReturn AlpsHIDEventDriver::u1_read_write_register(
+    UInt32 address,
+    UInt8 *read_val,
+    UInt8 write_val,
+    bool read_flag
+) {
+    if (!hid_interface || (read_flag && !read_val))
+        return kIOReturnBadArgument;
+
+    UInt8 check_sum = 0;
     UInt8 input[U1_FEATURE_REPORT_LEN] = {};
     UInt8 readbuf[U1_FEATURE_REPORT_LEN] = {};
-    IOReturn ret = kIOReturnSuccess;
-    
-    
+
     input[0] = U1_FEATURE_REPORT_ID;
+
     if (read_flag) {
         input[1] = U1_CMD_REGISTER_READ;
         input[6] = 0x00;
@@ -623,103 +715,162 @@ IOReturn AlpsHIDEventDriver::u1_read_write_register(UInt32 address, UInt8 *read_
         input[1] = U1_CMD_REGISTER_WRITE;
         input[6] = write_val;
     }
-    
+
     put_unaligned_le32(address, input + 2);
-    
-    /* Calculate the checksum */
+
     check_sum = U1_FEATURE_REPORT_LEN_ALL;
-    for (int i = 0; i < U1_FEATURE_REPORT_LEN - 1; i++)
+    for (int i = 0; i < U1_FEATURE_REPORT_LEN - 1; ++i)
         check_sum += input[i];
-    
+
     input[7] = check_sum;
-    
-    
-    
-    OSData* input_updated = OSData::withBytes(input, U1_FEATURE_REPORT_LEN);
-    IOBufferMemoryDescriptor* report = IOBufferMemoryDescriptor::withBytes(input_updated->getBytesNoCopy(0, U1_FEATURE_REPORT_LEN), input_updated->getLength(), kIODirectionInOut);
-    
+
+    OSData* input_updated =
+        OSData::withBytes(input, sizeof(input));
+    if (!input_updated)
+        return kIOReturnNoMemory;
+
+    IOBufferMemoryDescriptor* report =
+        IOBufferMemoryDescriptor::withBytes(
+            input_updated->getBytesNoCopy(0, sizeof(input)),
+            input_updated->getLength(),
+            kIODirectionInOut);
+
     input_updated->release();
-    
-    ret = hid_interface->setReport(report, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
-    
+
+    if (!report)
+        return kIOReturnNoMemory;
+
+    IOReturn ret = hid_interface->setReport(
+        report, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
+
+    if (ret != kIOReturnSuccess)
+        goto exit;
+
     if (read_flag) {
-        
-        ret = hid_interface->getReport(report, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
-        
-        report->readBytes(0, &readbuf, U1_FEATURE_REPORT_LEN);
-        
+        ret = hid_interface->getReport(
+            report, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
+
+        if (ret != kIOReturnSuccess)
+            goto exit;
+
+        if (report->readBytes(0, readbuf, sizeof(readbuf))
+            != sizeof(readbuf)) {
+            ret = kIOReturnError;
+            goto exit;
+        }
+
         *read_val = readbuf[6];
-        
     }
-    
+
+exit:
     report->release();
-    
     return ret;
 }
 
-IOReturn AlpsHIDEventDriver::t4_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag) {
-    
-    UInt16 check_sum;
+IOReturn AlpsHIDEventDriver::t4_read_write_register(
+    UInt32 address,
+    UInt8 *read_val,
+    UInt8 write_val,
+    bool read_flag
+) {
+    if (!hid_interface || (read_flag && !read_val))
+        return kIOReturnBadArgument;
+
+    UInt16 check_sum = 0;
     UInt8 input[T4_FEATURE_REPORT_LEN] = {};
     UInt8 readbuf[T4_FEATURE_REPORT_LEN] = {};
-    IOReturn ret = kIOReturnSuccess;
-    
+
     input[0] = T4_FEATURE_REPORT_ID;
-    if (read_flag) {
-        input[1] = T4_CMD_REGISTER_READ;
-        input[8] = 0x00;
-    } else {
-        input[1] = T4_CMD_REGISTER_WRITE;
-        input[8] = write_val;
-    }
+    input[1] = read_flag
+        ? T4_CMD_REGISTER_READ
+        : T4_CMD_REGISTER_WRITE;
+
+    input[8] = read_flag ? 0x00 : write_val;
+
     put_unaligned_le32(address, input + 2);
     input[6] = 1;
     input[7] = 0;
-    
-    /* Calculate the checksum */
+
     check_sum = t4_calc_check_sum(input, 1, 8);
     input[9] = (UInt8)check_sum;
     input[10] = (UInt8)(check_sum >> 8);
     input[11] = 0;
-    
-    OSData* input_updated = OSData::withBytes(input, T4_FEATURE_REPORT_LEN);
-    IOBufferMemoryDescriptor* report = IOBufferMemoryDescriptor::withBytes(input_updated->getBytesNoCopy(0, T4_FEATURE_REPORT_LEN), input_updated->getLength(), kIODirectionInOut);
-    
-    input_updated->release();
-    
-    hid_interface->setReport(report, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
 
+    OSData* input_updated =
+        OSData::withBytes(input, sizeof(input));
+
+    if (!input_updated)
+        return kIOReturnNoMemory;
+
+    IOBufferMemoryDescriptor* report =
+        IOBufferMemoryDescriptor::withBytes(
+            input_updated->getBytesNoCopy(0, sizeof(input)),
+            input_updated->getLength(),
+            kIODirectionInOut);
+
+    input_updated->release();
+
+    if (!report)
+        return kIOReturnNoMemory;
+
+    IOReturn ret = hid_interface->setReport(
+        report, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
+
+    if (ret != kIOReturnSuccess)
+        goto exit;
 
     if (read_flag) {
-        
- 
-        ret = hid_interface->getReport(report, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
-        
-        report->readBytes(0, &readbuf, T4_FEATURE_REPORT_LEN);
+        ret = hid_interface->getReport(
+            report, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
 
-        if (*(UInt32 *)&readbuf[6] != address) {
-            IOLog("read register address error (%x,%x)\n", *(UInt32 *)&readbuf[6], address);
-            goto exit_readbuf;
+        if (ret != kIOReturnSuccess)
+            goto exit;
+
+        if (report->readBytes(0, readbuf, sizeof(readbuf))
+            != sizeof(readbuf)) {
+            ret = kIOReturnError;
+            goto exit;
         }
-        
-        if (*(UInt16 *)&readbuf[10] != 1) {
-            IOLog("read register size error (%x)\n", *(UInt16 *)&readbuf[10]);
-            goto exit_readbuf;
+
+        UInt32 responseAddress =
+            (UInt32)readbuf[6] |
+            ((UInt32)readbuf[7] << 8) |
+            ((UInt32)readbuf[8] << 16) |
+            ((UInt32)readbuf[9] << 24);
+
+        if (responseAddress != address) {
+            IOLog("T4 register address mismatch "
+                  "(%x, %x)\n",
+                  responseAddress, address);
+            ret = kIOReturnError;
+            goto exit;
         }
-        
+
+        UInt16 responseSize = get_unaligned_le16(&readbuf[10]);
+
+        if (responseSize != 1) {
+            IOLog("T4 register size error (%x)\n",
+                  responseSize);
+            ret = kIOReturnError;
+            goto exit;
+        }
+
         check_sum = t4_calc_check_sum(readbuf, 6, 7);
-        if (*(UInt16 *)&readbuf[13] != check_sum) {
-            IOLog("read register checksum error (%x,%x)\n", *(UInt16 *)&readbuf[13], check_sum);
-            goto exit_readbuf;
+
+        UInt16 responseChecksum =
+            get_unaligned_le16(&readbuf[13]);
+
+        if (responseChecksum != check_sum) {
+            IOLog("T4 register checksum error "
+                  "(%x, %x)\n",
+                  responseChecksum, check_sum);
+            ret = kIOReturnError;
+            goto exit;
         }
-        
+
         *read_val = readbuf[12];
     }
-    
-    report->release();
-    return ret;
-    
-exit_readbuf:
+
 exit:
     report->release();
     return ret;
