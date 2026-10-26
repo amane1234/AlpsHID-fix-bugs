@@ -1,16 +1,12 @@
-
 /*This code is derived and adapted from VoodooI2CHID's Multitouch Event Driver and Precision
 Touchpad Event Driver (https://github.com/alexandred/VoodooI2C) and the Linux kernel driver
 for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/hid/hid-alps.c) */
 
-
-
-
 #ifndef AlpsHIDEventDriver_hpp
 #define AlpsHIDEventDriver_hpp
 
+// Keeps Apple's IOHIDEventDriver.h out of the build (this driver supplies its own event handling)
 #define _IOKIT_HID_IOHIDEVENTDRIVER_H
-
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOKitKeys.h>
@@ -20,12 +16,11 @@ for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/
 #include <IOKit/hid/IOHIDInterface.h>
 #include <kern/clock.h>
 
-
-#include "IOKit/hid/IOHIDEvent.h"
-#include "IOKit/hid/IOHIDEventService.h"
-#include "IOKit/hid/IOHIDEventTypes.h"
+#include <IOKit/hid/IOHIDEvent.h>
+#include <IOKit/hid/IOHIDEventService.h>
+#include <IOKit/hid/IOHIDEventTypes.h>
 #include <IOKit/hidsystem/IOHIDTypes.h>
-#include "IOKit/hid/IOHIDPrivateKeys.h"
+#include <IOKit/hid/IOHIDPrivateKeys.h>
 #include <IOKit/hid/IOHIDUsageTables.h>
 #include <IOKit/hid/IOHIDDevice.h>
 
@@ -35,77 +30,83 @@ for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/
 
 #include "helpers.hpp"
 
-#define HID_PRODUCT_ID_T3_BTNLESS   0xD0C0
-#define HID_PRODUCT_ID_COSMO        0x1202
-#define HID_PRODUCT_ID_U1_DUAL      0x120B
-#define HID_PRODUCT_ID_T4_BTNLESS   0x120C
-#define HID_PRODUCT_ID_G1           0x120D
-#define HID_PRODUCT_ID_U1           0x1209
-#define HID_PRODUCT_ID_U1_UNICORN_LEGACY    0x121E
-#define HID_PRODUCT_ID_U1_OLDMAN    0x1215
-#define HID_PRODUCT_ID_T4_USB       0X1216
-#define HID_PRODUCT_ID_T4_USB_2     0X1217
-#define HID_PRODUCT_ID_T4_USB_3     0x120f
-#define HID_PRODUCT_ID_T4_USB_4     0x1218
-#define HID_PRODUCT_ID_U1_PTP_1     0x1207
-#define HID_PRODUCT_ID_U1_PTP_2     0x120A
-#define HID_PRODUCT_ID_U1_DUAL_PTP  0x121F
-#define HID_PRODUCT_ID_U1_DUAL_3BTN_PTP    0x1220
-#define HID_PRODUCT_ID_U1_1222      0x1222
+#define HID_PRODUCT_ID_T3_BTNLESS 0xD0C0
+#define HID_PRODUCT_ID_COSMO 0x1202
+#define HID_PRODUCT_ID_U1_DUAL 0x120B
+#define HID_PRODUCT_ID_T4_BTNLESS 0x120C
+#define HID_PRODUCT_ID_G1 0x120D
+#define HID_PRODUCT_ID_U1 0x1209
+#define HID_PRODUCT_ID_U1_UNICORN_LEGACY 0x121E
+#define HID_PRODUCT_ID_U1_OLDMAN 0x1215
+#define HID_PRODUCT_ID_T4_USB 0x1216
+#define HID_PRODUCT_ID_T4_USB_2 0x1217
+#define HID_PRODUCT_ID_T4_USB_3 0x120f
+#define HID_PRODUCT_ID_T4_USB_4 0x1218
+#define HID_PRODUCT_ID_U1_PTP_1 0x1207
+#define HID_PRODUCT_ID_U1_PTP_2 0x120A
+#define HID_PRODUCT_ID_U1_DUAL_PTP 0x121F
+#define HID_PRODUCT_ID_U1_DUAL_3BTN_PTP 0x1220
+#define HID_PRODUCT_ID_U1_1222 0x1222
 
-#define ALPS_VENDOR                 0x44e
-#define CIRQUE_VENDOR               0x0488
+#define ALPS_VENDOR 0x44e
+#define CIRQUE_VENDOR 0x0488
 
-#define T4_INPUT_REPORT_LEN         sizeof(struct t4_input_report)
-#define T4_FEATURE_REPORT_LEN       T4_INPUT_REPORT_LEN
-#define T4_FEATURE_REPORT_ID        0x07
-#define T4_CMD_REGISTER_READ        0x08
-#define T4_CMD_REGISTER_WRITE       0x07
-#define T4_INPUT_REPORT_ID          0x09
+#define T4_INPUT_REPORT_LEN sizeof(struct t4_input_report)
+#define T4_FEATURE_REPORT_LEN T4_INPUT_REPORT_LEN
+#define T4_FEATURE_REPORT_ID 0x07
+#define T4_CMD_REGISTER_READ 0x08
+#define T4_CMD_REGISTER_WRITE 0x07
+#define T4_INPUT_REPORT_ID 0x09
 
-#define T4_ADDRESS_BASE                0xC2C0
-#define PRM_SYS_CONFIG_1            (T4_ADDRESS_BASE + 0x0002)
-#define T4_PRM_FEED_CONFIG_1        (T4_ADDRESS_BASE + 0x0004)
-#define T4_PRM_FEED_CONFIG_4        (T4_ADDRESS_BASE + 0x001A)
-#define T4_PRM_ID_CONFIG_3          (T4_ADDRESS_BASE + 0x00B0)
-#define T4_GPIO_PINS                (T4_ADDRESS_BASE + 0x000C)
+#define T4_ADDRESS_BASE 0xC2C0
+#define PRM_SYS_CONFIG_1 (T4_ADDRESS_BASE + 0x0002)
+#define T4_PRM_FEED_CONFIG_1 (T4_ADDRESS_BASE + 0x0004)
+#define T4_PRM_FEED_CONFIG_4 (T4_ADDRESS_BASE + 0x001A)
+#define T4_PRM_ID_CONFIG_3 (T4_ADDRESS_BASE + 0x00B0)
+#define T4_GPIO_PINS (T4_ADDRESS_BASE + 0x000C)
 
-#define T4_FEEDCFG4_ADVANCED_ABS_ENABLE            0x01
-#define T4_I2C_ABS                  0x78
+#define T4_FEEDCFG4_ADVANCED_ABS_ENABLE 0x01
+#define T4_I2C_ABS 0x78
+#define T4_COUNT_PER_ELECTRODE 256
 
-#define T4_COUNT_PER_ELECTRODE      256
-#define MAX_TOUCHES                 5
+/* Number of touches the driver reports to VoodooInput */
+#define MAX_TOUCHES 5
 
-#define U1_MOUSE_REPORT_ID          0x01 /* Mouse data ReportID */
-#define U1_ABSOLUTE_REPORT_ID       0x03 /* Absolute data ReportID */
-#define U1_ABSOLUTE_REPORT_ID_SECD  0x02 /* FW-PTP Absolute data ReportID */
-#define U1_FEATURE_REPORT_ID        0x05 /* Feature ReportID */
-#define U1_SP_ABSOLUTE_REPORT_ID    0x06 /* Feature ReportID */
+/* Number of contact slots in the T4/U1 absolute reports as they come over the wire.
+ * This is fixed by the hardware report layout (see the packed structs below) and is deliberately NOT
+ * tied to MAX_TOUCHES. Code indexing contact[] must stay below it, e.g. with the max_fingers the device reports. */
+#define ALPS_REPORT_MAX_CONTACTS 5
 
-#define U1_FEATURE_REPORT_LEN       0x08 /* Feature Report Length */
-#define U1_FEATURE_REPORT_LEN_ALL   0x0A
-#define U1_CMD_REGISTER_READ        0xD1
-#define U1_CMD_REGISTER_WRITE       0xD2
+#define U1_MOUSE_REPORT_ID 0x01 /* Mouse data ReportID */
+#define U1_ABSOLUTE_REPORT_ID 0x03 /* Absolute data ReportID */
+#define U1_ABSOLUTE_REPORT_ID_SECD 0x02 /* FW-PTP Absolute data ReportID */
+#define U1_FEATURE_REPORT_ID 0x05 /* Feature ReportID */
+#define U1_SP_ABSOLUTE_REPORT_ID 0x06 /* SP (trackstick) absolute data ReportID */
 
-#define U1_DEVTYPE_SP_SUPPORT       0x10 /* SP Support */
-#define U1_DISABLE_DEV              0x01
-#define U1_TP_ABS_MODE              0x02
-#define U1_SP_ABS_MODE              0x80
+#define U1_FEATURE_REPORT_LEN 0x08 /* Feature Report Length */
+#define U1_FEATURE_REPORT_LEN_ALL 0x0A
+#define U1_CMD_REGISTER_READ 0xD1
+#define U1_CMD_REGISTER_WRITE 0xD2
 
-#define ADDRESS_U1_DEV_CTRL_1       0x00800040
-#define ADDRESS_U1_DEVICE_TYP       0x00800043
-#define ADDRESS_U1_NUM_SENS_X       0x00800047
-#define ADDRESS_U1_NUM_SENS_Y       0x00800048
-#define ADDRESS_U1_PITCH_SENS_X     0x00800049
-#define ADDRESS_U1_PITCH_SENS_Y     0x0080004A
-#define ADDRESS_U1_RESO_DWN_ABS     0x0080004E
-#define ADDRESS_U1_PAD_BTN          0x00800052
-#define ADDRESS_U1_SP_BTN           0x0080009F
+#define U1_DEVTYPE_SP_SUPPORT 0x10 /* SP Support */
+#define U1_DISABLE_DEV 0x01
+#define U1_TP_ABS_MODE 0x02
+#define U1_SP_ABS_MODE 0x80
 
+#define ADDRESS_U1_DEV_CTRL_1 0x00800040
+#define ADDRESS_U1_DEVICE_TYP 0x00800043
+#define ADDRESS_U1_NUM_SENS_X 0x00800047
+#define ADDRESS_U1_NUM_SENS_Y 0x00800048
+#define ADDRESS_U1_PITCH_SENS_X 0x00800049
+#define ADDRESS_U1_PITCH_SENS_Y 0x0080004A
+#define ADDRESS_U1_RESO_DWN_ABS 0x0080004E
+#define ADDRESS_U1_PAD_BTN 0x00800052
+#define ADDRESS_U1_SP_BTN 0x0080009F
+
+static_assert(MAX_TOUCHES <= ALPS_REPORT_MAX_CONTACTS, "MAX_TOUCHES cannot exceed the contact slots of the device reports");
 
 // Message types defined by ApplePS2Keyboard
-enum
-{
+enum {
     // from keyboard to mouse/touchpad
     kKeyboardSetTouchStatus = iokit_vendor_specific_msg(100),   // set disable/enable touchpad (data is bool*)
     kKeyboardGetTouchStatus = iokit_vendor_specific_msg(101),   // get disable/enable touchpad (data is bool*)
@@ -118,126 +119,126 @@ enum dev_num {
 };
 
 struct alps_dev {
-    UInt8     max_fingers;
-    UInt8     has_sp;
-    UInt8     sp_btn_info;
-    UInt32    x_active_len_mm;
-    UInt32    y_active_len_mm;
-    UInt32    x_max;
-    UInt32    y_max;
-    UInt32    x_min;
-    UInt32    y_min;
-    UInt32    btn_cnt;
-    UInt32    sp_btn_cnt;
-
+    UInt8 max_fingers;
+    UInt8 has_sp;
+    UInt8 sp_btn_info;
+    UInt32 x_active_len_mm;
+    UInt32 y_active_len_mm;
+    UInt32 x_max;
+    UInt32 y_max;
+    UInt32 x_min;
+    UInt32 y_min;
+    UInt32 btn_cnt;
+    UInt32 sp_btn_cnt;
 };
 
-
 struct __attribute__((__packed__)) t4_contact_data {
-    UInt8  palm;
-    UInt8    x_lo;
-    UInt8    x_hi;
-    UInt8    y_lo;
-    UInt8    y_hi;
+    UInt8 palm;
+    UInt8 x_lo;
+    UInt8 x_hi;
+    UInt8 y_lo;
+    UInt8 y_hi;
 };
 
 struct __attribute__((__packed__)) t4_input_report {
-    UInt8  reportID;
-    UInt8  numContacts;
-    struct t4_contact_data contact[5];
-    UInt8  button;
-    UInt8  track[5];
-    UInt8  zx[5], zy[5];
-    UInt8  palmTime[5];
-    UInt8  kilroy;
+    UInt8 reportID;
+    UInt8 numContacts;
+    struct t4_contact_data contact[ALPS_REPORT_MAX_CONTACTS];
+    UInt8 button;
+    UInt8 track[ALPS_REPORT_MAX_CONTACTS];
+    UInt8 zx[ALPS_REPORT_MAX_CONTACTS], zy[ALPS_REPORT_MAX_CONTACTS];
+    UInt8 palmTime[ALPS_REPORT_MAX_CONTACTS];
+    UInt8 kilroy;
     UInt16 timeStamp;
 };
 
 struct __attribute__((__packed__)) u1_contact_data {
-    UInt8    x_lo;
-    UInt8    x_hi;
-    UInt8    y_lo;
-    UInt8    y_hi;
-    UInt8       z;
+    UInt8 x_lo;
+    UInt8 x_hi;
+    UInt8 y_lo;
+    UInt8 y_hi;
+    UInt8 z;
 };
 
 struct __attribute__((__packed__)) u1_input_report {
-    UInt8  reportID;
-    UInt8  buttons;
-    UInt8  numContacts;
-    struct u1_contact_data contact[5];
-};
-
-struct __attribute__((__packed__)) u1_sp_input_report{
     UInt8 reportID;
     UInt8 buttons;
-    short x;
-    short y;
+    UInt8 numContacts;
+    struct u1_contact_data contact[ALPS_REPORT_MAX_CONTACTS];
+};
+
+struct __attribute__((__packed__)) u1_sp_input_report {
+    UInt8 reportID;
+    UInt8 buttons;
+    SInt16 x;
+    SInt16 y;
     UInt16 z;
 };
 
+/* These structs are overlaid on raw device reports, so their size is part of the hardware protocol.
+ * A changed packing/field type would silently shift every field after it; fail the build instead. */
+static_assert(sizeof(struct t4_contact_data) == 5, "t4_contact_data must be 5 bytes");
+static_assert(sizeof(struct t4_input_report) == 51, "t4_input_report must be 51 bytes");
+static_assert(sizeof(struct u1_contact_data) == 5, "u1_contact_data must be 5 bytes");
+static_assert(sizeof(struct u1_input_report) == 28, "u1_input_report must be 28 bytes");
+static_assert(sizeof(struct u1_sp_input_report) == 8, "u1_sp_input_report must be 8 bytes");
+
 class AlpsHIDEventDriver : public IOHIDEventService {
     OSDeclareDefaultStructors(AlpsHIDEventDriver);
-    
+
 public:
-    
     void handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
-    
+
     bool init(OSDictionary *properties) override;
-    
     bool start(IOService* provider) override;
-    
     bool handleStart(IOService* provider) override;
     void handleStop(IOService* provider) override;
-    
     bool handleOpen(IOService *forClient, IOOptionBits options, void *arg) override;
     void handleClose(IOService *forClient, IOOptionBits options) override;
-    
     virtual IOReturn message(UInt32 type, IOService* provider, void* argument) override;
     bool didTerminate(IOService* provider, IOOptionBits options, bool* defer) override;
-
     IOReturn setPowerState(unsigned long whichState, IOService* whatDevice) override;
-    
-    
+
     IOReturn publishMultitouchInterface();
-    
+
     void put_unaligned_le32(uint32_t val, void *p);
     void __put_unaligned_le16(uint16_t val, uint8_t *p);
     void __put_unaligned_le32(uint32_t val, uint8_t *p);
     UInt16 get_unaligned_le16(const void *p);
     UInt16 __get_unaligned_le16(const UInt8 *p);
 
-    
-    
 protected:
-    const char* name;
-    IOHIDInterface* hid_interface;
-    
+    const char* name = nullptr;
+    IOHIDInterface* hid_interface = nullptr;
+
 private:
     void t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
     void u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
-    bool ready;
-    uint64_t max_after_typing;
-    uint64_t key_time;
-    bool awake;
-    dev_num dev_type;
-    IOWorkLoop* work_loop;
-    IOCommandGate* command_gate;
-    
+
+    // Explicit initial values (IOKit zero-fills new objects, this just makes the intended state visible).
+    // ready/awake are written from the power/start path and read from the report callback.
+    bool ready = false;
+    uint64_t max_after_typing = 0;
+    uint64_t key_time = 0;
+    bool awake = false;
+    dev_num dev_type = U1;
+
+    IOWorkLoop* work_loop = nullptr;
+    IOCommandGate* command_gate = nullptr;
+
     VoodooInputEvent inputMessage;
     RelativePointerEvent spInputMessage;
-    IOService* voodooInputInstance;
-    
+
+    IOService* voodooInputInstance = nullptr;
+
     UInt16 t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length);
+
     /* Sends a report to the device to instruct it to enter Touchpad mode */
     void t4_device_init();
     bool u1_device_init();
-    
+
     IOReturn u1_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag);
     IOReturn t4_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag);
-    
 };
 
-
 #endif /* AlpsHIDEventDriver_hpp */
-
