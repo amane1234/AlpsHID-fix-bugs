@@ -9,18 +9,29 @@
 #define super IOHIDEventService
 OSDefineMetaClassAndStructors(AlpsHIDEventDriver, IOHIDEventService);
 
-void AlpsHIDEventDriver::t4_device_init() {
+// Copies at most max_len bytes of a report into buffer, never more than the buffer can hold
+// (the report length is device-controlled), and returns the number of bytes copied.
+static UInt32 copyReport(IOMemoryDescriptor* report, void* buffer, UInt32 max_len) {
+    UInt64 available = report->getLength();
+    UInt32 len = available < max_len ? (UInt32)available : max_len;
+
+    return (UInt32)report->readBytes(0, buffer, len);
+}
+
+bool AlpsHIDEventDriver::t4_device_init() {
     
     ready = false;
     
     UInt8 tmp = '\0', sen_line_num_x, sen_line_num_y;
-    alps_dev pri_data;
+    alps_dev pri_data = {};
     IOReturn ret = kIOReturnSuccess;
-    /*
-    if (!hid_interface){
-        IOLog("HID interface not found");
-        goto exit;
-    }*/
+    
+    // hid_interface is cleared in didTerminate(); this is also called from the wake-up path,
+    // so a missing interface must not be dereferenced
+    if (!hid_interface) {
+        IOLog("%s::%s HID interface not found\n", getName(), name ? name : "unknown");
+        return false;
+    }
     if (hid_interface->getProductID() == HID_PRODUCT_ID_T4_BTNLESS) {
         ret = t4_read_write_register(T4_PRM_ID_CONFIG_3, &tmp, 0, true);
         if (ret!=kIOReturnSuccess) {
@@ -74,11 +85,11 @@ void AlpsHIDEventDriver::t4_device_init() {
     setProperty(VOODOO_INPUT_PHYSICAL_MAX_Y_KEY, 6140, 32);
     
     ready = true;
-    return;
+    return true;
     
 exit:
     ready = false;
-    return;
+    return false;
 }
 
 void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
@@ -97,18 +108,29 @@ bool AlpsHIDEventDriver::start(IOService* provider) {
     if (!super::start(provider))
         return false;
     
+    // super::start() has already run handleStart() (interface opened, power management registered).
+    // The framework does not call stop() when start() fails, so undo that via stop -> handleStop.
+    auto fail = [&]() -> bool {
+        super::stop(provider);
+        return false;
+    };
+    
     work_loop = this->getWorkLoop();
     
     if (!work_loop)
-        return false;
+        return fail();
     
     work_loop->retain();
     
     command_gate = IOCommandGate::commandGate(this);
     if (!command_gate) {
-        return false;
+        return fail();
     }
-    work_loop->addEventSource(command_gate);
+    
+    if (work_loop->addEventSource(command_gate) != kIOReturnSuccess) {
+        OSSafeReleaseNULL(command_gate);
+        return fail();
+    }
     
     max_after_typing = 500000000;
     key_time = 0;
@@ -168,22 +190,18 @@ bool AlpsHIDEventDriver::handleStart(IOService* provider) {
     if (!hid_interface->open(this, 0, OSMemberFunctionCast(IOHIDInterface::InterruptReportAction, this, &AlpsHIDEventDriver::handleInterruptReport), NULL))
         return false;
     
-    name = (char*) hid_interface->getProduct();
+    // getProduct() returns an OSString*. It used to be cast to char* and then printed with %s,
+    // i.e. the OSString object itself was read as if it were the text.
+    OSString* product = hid_interface->getProduct();
+    name = product ? product->getCStringNoCopy() : "unknown";
     
+    // Documented order: PMinit(), joinPMtree(), registerPowerDriver()
     PMinit();
-    
-    registerPowerDriver(this, VoodooI2CIOPMPowerStates, kVoodooI2CIOPMNumberPowerStates);
-
     hid_interface->joinPMtree(this);
+    registerPowerDriver(this, VoodooI2CIOPMPowerStates, kVoodooI2CIOPMNumberPowerStates);
     
-    switch (dev_type) {
-        case T4:
-            t4_device_init();
-            break;
-        case U1:
-            u1_device_init();
-            break;
-    }
+    if (!initialiseDeviceWithRetry(0))
+        IOLog("%s::%s Device initialisation failed, the touchpad stays disabled\n", getName(), name);
     
     publishMultitouchInterface();
     
@@ -195,8 +213,10 @@ IOReturn AlpsHIDEventDriver::setPowerState(
     unsigned long whichState,
     IOService* whatDevice
 ) {
+    // The return value of a setPowerState() callback is "microseconds until the change is complete"
+    // (kIOPMAckImplied == 0 means: done). An IOReturn error code here is read as an enormous delay.
     if (whatDevice != this)
-        return kIOReturnInvalid;
+        return kIOPMAckImplied;
 
     if (!whichState) {
         awake = false;
@@ -209,40 +229,10 @@ IOReturn AlpsHIDEventDriver::setPowerState(
     }
 
     if (!awake) {
-        bool initialized = false;
-
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            // Allow the I2C controller to recover after wake.
-            IOSleep(attempt == 0 ? 10 : 50);
-
-            switch (dev_type) {
-                case T4:
-                    t4_device_init();
-                    initialized = ready;
-                    break;
-
-                case U1:
-                    initialized = u1_device_init();
-                    break;
-
-                default:
-                    initialized = false;
-                    break;
-            }
-
-            if (initialized) {
-                IOLog("%s::%s Wake initialization succeeded "
-                      "(attempt %d/3)\n",
-                      getName(), name ? name : "unknown",
-                      attempt + 1);
-                break;
-            }
-
-            IOLog("%s::%s Wake initialization failed "
-                  "(attempt %d/3)\n",
-                  getName(), name ? name : "unknown",
-                  attempt + 1);
-        }
+        // After S4 the touchpad has lost power completely and needs noticeably longer than after S3
+        // before it answers feature reports again, so back off for up to ~2 s instead of giving up
+        // after ~0.1 s.
+        bool initialized = initialiseDeviceWithRetry(10);
 
         // Do not mark the device as awake if initialization failed.
         awake = initialized;
@@ -252,6 +242,57 @@ IOReturn AlpsHIDEventDriver::setPowerState(
     }
 
     return kIOPMAckImplied;
+}
+
+bool AlpsHIDEventDriver::initialiseDevice() {
+    // hid_interface is cleared in didTerminate(), which can race with a wake-up
+    if (!hid_interface) {
+        ready = false;
+        return false;
+    }
+
+    switch (dev_type) {
+        case T4:
+            return t4_device_init();
+
+        case U1:
+            return u1_device_init();
+    }
+
+    ready = false;
+    return false;
+}
+
+bool AlpsHIDEventDriver::initialiseDeviceWithRetry(UInt32 first_delay_ms) {
+    // Delay (ms) before every further attempt: the firmware needs time to come back after a power loss
+    static const UInt32 retry_delays_ms[] = { 50, 100, 250, 500, 1000 };
+    const int attempts = 1 + (int)(sizeof(retry_delays_ms) / sizeof(retry_delays_ms[0]));
+
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        UInt32 delay_ms = attempt == 0 ? first_delay_ms : retry_delays_ms[attempt - 1];
+
+        if (delay_ms)
+            IOSleep(delay_ms);
+
+        // The device may have been terminated while we were waiting
+        if (!hid_interface)
+            break;
+
+        if (initialiseDevice()) {
+            IOLog("%s::%s Initialization succeeded "
+                  "(attempt %d/%d)\n",
+                  getName(), name ? name : "unknown",
+                  attempt + 1, attempts);
+            return true;
+        }
+
+        IOLog("%s::%s Initialization failed "
+              "(attempt %d/%d)\n",
+              getName(), name ? name : "unknown",
+              attempt + 1, attempts);
+    }
+
+    return false;
 }
 
 UInt16 AlpsHIDEventDriver::t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length)
@@ -291,9 +332,24 @@ IOReturn AlpsHIDEventDriver::publishMultitouchInterface() {
 }
 
 void AlpsHIDEventDriver::handleStop(IOService* provider) {
-    work_loop->removeEventSource(command_gate);
-    OSSafeReleaseNULL(command_gate);
+    ready = false;
+
+    if (command_gate) {
+        if (work_loop)
+            work_loop->removeEventSource(command_gate);
+
+        OSSafeReleaseNULL(command_gate);
+    }
+
     OSSafeReleaseNULL(work_loop);
+
+    // didTerminate() already did this if the device went away; a plain stop still has to close it
+    if (hid_interface) {
+        hid_interface->close(this);
+        hid_interface = NULL;
+    }
+
+    OSSafeReleaseNULL(voodooInputInstance);
 
     PMstop();
     super::handleStop(provider);
@@ -305,16 +361,20 @@ IOReturn AlpsHIDEventDriver::message(UInt32 type, IOService* provider, void* arg
     {
         case kKeyboardKeyPressTime:
         {
+            if (!argument)
+                return kIOReturnBadArgument;
+
             //  Remember last time key was pressed
             key_time = *((uint64_t*)argument);
 #if DEBUG
             IOLog("%s::keyPressed = %llu\n", getName(), key_time);
 #endif
-            break;
+            return kIOReturnSuccess;
         }
     }
-    
-    return kIOReturnSuccess;
+
+    // Don't swallow messages we don't handle ourselves
+    return super::message(type, provider, argument);
 }
 
 bool AlpsHIDEventDriver::init(OSDictionary *properties) {
@@ -329,6 +389,8 @@ bool AlpsHIDEventDriver::init(OSDictionary *properties) {
 
 
 bool AlpsHIDEventDriver::didTerminate(IOService* provider, IOOptionBits options, bool* defer) {
+    ready = false;
+
     if (hid_interface)
         hid_interface->close(this);
     hid_interface = NULL;
@@ -347,7 +409,7 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     if (now_ns - key_time < max_after_typing)
         return;
     
-    if (!ready || !report)
+    if (!ready || !report || !voodooInputInstance)
         return;
     
     if (report_type != kIOHIDReportTypeInput)
@@ -356,11 +418,20 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     if (report_id != T4_INPUT_REPORT_ID)
         return;
     
-    t4_input_report reportData;
+    // A report shorter than expected would leave the rest of reportData as uninitialised stack garbage
+    t4_input_report reportData = {};
+    
+    if (copyReport(report, &reportData, T4_INPUT_REPORT_LEN) != T4_INPUT_REPORT_LEN)
+        return;
+    
+    // When palm is detected just dont send anything.
+    // This is checked before any transducer is touched, so a dropped frame leaves no half-updated state.
+    for (int i = 0; i < MAX_TOUCHES; i++) {
+        if (reportData.contact[i].palm & 0x80)
+            return;
+    }
     
     unsigned int x, y;
-    
-    report->readBytes(0, &reportData, T4_INPUT_REPORT_LEN);
     
     int contactCount = 0;
     for (int i = 0; i < MAX_TOUCHES; i++) {
@@ -373,12 +444,8 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         x = reportData.contact[i].x_hi << 8 | reportData.contact[i].x_lo;
         y = reportData.contact[i].y_hi << 8 | reportData.contact[i].y_lo;
         y = 3060 - y + 255;
-        bool contactValid= (reportData.contact[i].palm < 0x80 &&
-                            reportData.contact[i].palm > 0) * 62;
-        //When palm is detected just dont send anything
-        if(reportData.contact[i].palm & 0x80){
-            return;
-        }
+        bool contactValid = (reportData.contact[i].palm < 0x80 &&
+                             reportData.contact[i].palm > 0);
         transducer->isValid = contactValid;
         transducer->timestamp = timestamp;
         transducer->supportsPressure = false;
@@ -407,9 +474,10 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     
     if (contactCount >= 4 || inputMessage.transducers->isPhysicalButtonDown) {
         // simple thumb detection: to find the lowest finger touch in the vertical direction.
+        // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
         UInt32 y_max = 0;
         int thumb_index = 0;
-        for (int i = 0; i < contactCount; i++) {
+        for (int i = 0; i < MAX_TOUCHES; i++) {
             VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
             if (inputTransducer->isValid && inputTransducer->currentCoordinates.y >= y_max) {
                 y_max = inputTransducer->currentCoordinates.y;
@@ -419,9 +487,6 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
     }
 
-    
-    
-    
     super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance, &inputMessage, sizeof(VoodooInputEvent));
 }
 
@@ -439,7 +504,7 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     if (now_ns - key_time < max_after_typing)
         return;
     
-    if (!ready || !report)
+    if (!ready || !report || !voodooInputInstance)
         return;
     
     if (report_type != kIOHIDReportTypeInput)
@@ -449,8 +514,11 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     
     if(report_id==U1_ABSOLUTE_REPORT_ID || report_id==U1_ABSOLUTE_REPORT_ID_SECD) {
         
-        u1_input_report reportData;
-        report->readBytes(0, &reportData, report->getLength());
+        // The report length comes from the device: it used to be passed to readBytes() as-is, which
+        // overflowed this stack buffer for reports longer than the struct. Zero-fill covers shorter ones.
+        u1_input_report reportData = {};
+        if (copyReport(report, &reportData, sizeof(reportData)) == 0)
+            return;
 #if DEBUG
         IOLog("%s::%s Getting touched\n",getName(),name);
 #endif
@@ -501,9 +569,10 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         
         if (contactCount >= 4 || inputMessage.transducers->isPhysicalButtonDown) {
             // simple thumb detection: to find the lowest finger touch in the vertical direction.
+            // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
             UInt32 y_max = 0;
             int thumb_index = 0;
-            for (int i = 0; i < contactCount; i++) {
+            for (int i = 0; i < MAX_TOUCHES; i++) {
                 VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
                 if (inputTransducer->isValid && inputTransducer->currentCoordinates.y >= y_max) {
                     y_max = inputTransducer->currentCoordinates.y;
@@ -520,8 +589,10 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     }
     
     if(report_id== U1_SP_ABSOLUTE_REPORT_ID){
-        u1_sp_input_report reportData;
-        report->readBytes(0, &reportData, report->getLength());
+        u1_sp_input_report reportData = {};
+        // Same overflow as above (report->getLength() was used as the copy size). x and y are needed at least.
+        if (copyReport(report, &reportData, sizeof(reportData)) < offsetof(struct u1_sp_input_report, z))
+            return;
 #if DEBUG
         IOLog("%s::%s Getting poked dx:%i, dy:%i \n", getName(), name, reportData.x, reportData.y);
 #endif
@@ -724,18 +795,10 @@ IOReturn AlpsHIDEventDriver::u1_read_write_register(
 
     input[7] = check_sum;
 
-    OSData* input_updated =
-        OSData::withBytes(input, sizeof(input));
-    if (!input_updated)
-        return kIOReturnNoMemory;
-
+    // Hand the bytes straight to the descriptor (no intermediate OSData copy)
     IOBufferMemoryDescriptor* report =
         IOBufferMemoryDescriptor::withBytes(
-            input_updated->getBytesNoCopy(0, sizeof(input)),
-            input_updated->getLength(),
-            kIODirectionInOut);
-
-    input_updated->release();
+            input, sizeof(input), kIODirectionInOut);
 
     if (!report)
         return kIOReturnNoMemory;
@@ -796,19 +859,10 @@ IOReturn AlpsHIDEventDriver::t4_read_write_register(
     input[10] = (UInt8)(check_sum >> 8);
     input[11] = 0;
 
-    OSData* input_updated =
-        OSData::withBytes(input, sizeof(input));
-
-    if (!input_updated)
-        return kIOReturnNoMemory;
-
+    // Hand the bytes straight to the descriptor (no intermediate OSData copy)
     IOBufferMemoryDescriptor* report =
         IOBufferMemoryDescriptor::withBytes(
-            input_updated->getBytesNoCopy(0, sizeof(input)),
-            input_updated->getLength(),
-            kIODirectionInOut);
-
-    input_updated->release();
+            input, sizeof(input), kIODirectionInOut);
 
     if (!report)
         return kIOReturnNoMemory;
@@ -879,33 +933,36 @@ exit:
 
 void AlpsHIDEventDriver::put_unaligned_le32(uint32_t val, void *p)
 {
-    __put_unaligned_le32(val, (uint8_t*)p);
+    put_le32(val, (uint8_t*)p);
 }
 
-void AlpsHIDEventDriver::__put_unaligned_le16(uint16_t val, uint8_t *p)
+void AlpsHIDEventDriver::put_le16(uint16_t val, uint8_t *p)
 {
     *p++ = val;
     *p++ = val >> 8;
 }
 
-void AlpsHIDEventDriver::__put_unaligned_le32(uint32_t val, uint8_t *p)
+void AlpsHIDEventDriver::put_le32(uint32_t val, uint8_t *p)
 {
-    __put_unaligned_le16(val >> 16, p + 2);
-    __put_unaligned_le16(val, p);
+    put_le16(val >> 16, p + 2);
+    put_le16(val, p);
 }
 
 UInt16 AlpsHIDEventDriver::get_unaligned_le16(const void *p)
 {
-    return __get_unaligned_le16((const UInt8 *)p);
+    return get_le16((const UInt8 *)p);
 }
 
-UInt16 AlpsHIDEventDriver::__get_unaligned_le16(const UInt8 *p)
+UInt16 AlpsHIDEventDriver::get_le16(const UInt8 *p)
 {
     return p[0] | p[1] << 8;
 }
 
 bool AlpsHIDEventDriver::handleOpen(IOService *forClient, IOOptionBits options, void *arg) {
     if (forClient && forClient->getProperty(VOODOO_INPUT_IDENTIFIER)) {
+        // A second open must not leak the first retain
+        OSSafeReleaseNULL(voodooInputInstance);
+
         voodooInputInstance = forClient;
         voodooInputInstance->retain();
         
@@ -916,6 +973,10 @@ bool AlpsHIDEventDriver::handleOpen(IOService *forClient, IOOptionBits options, 
 }
 
 void AlpsHIDEventDriver::handleClose(IOService *forClient, IOOptionBits options) {
-    OSSafeReleaseNULL(voodooInputInstance);
+    // Any client can close: only drop the VoodooInput reference when it is VoodooInput that closes,
+    // otherwise the pointer used by the report handlers would dangle.
+    if (forClient == voodooInputInstance)
+        OSSafeReleaseNULL(voodooInputInstance);
+
     super::handleClose(forClient, options);
 }
