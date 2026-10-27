@@ -201,12 +201,6 @@ public:
 
     IOReturn publishMultitouchInterface();
 
-    void put_unaligned_le32(uint32_t val, void *p);
-    void __put_unaligned_le16(uint16_t val, uint8_t *p);
-    void __put_unaligned_le32(uint32_t val, uint8_t *p);
-    UInt16 get_unaligned_le16(const void *p);
-    UInt16 __get_unaligned_le16(const UInt8 *p);
-
 protected:
     const char* name = nullptr;
     IOHIDInterface* hid_interface = nullptr;
@@ -233,9 +227,24 @@ private:
 
     UInt16 t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length);
 
-    /* Sends a report to the device to instruct it to enter Touchpad mode */
-    void t4_device_init();
+    /* Sends a report to the device to instruct it to enter Touchpad mode. They return whether the
+     * device is now ready (and set `ready` accordingly). */
+    bool t4_device_init();
     bool u1_device_init();
+
+    /* Picks t4_/u1_device_init() by dev_type (and refuses to run once hid_interface is gone) */
+    bool initialiseDevice();
+
+    /* initialiseDevice() with back-off: the touchpad needs time to answer after a power loss (S4).
+     * first_delay_ms is the settle time before the first attempt. */
+    bool initialiseDeviceWithRetry(UInt32 first_delay_ms);
+
+    /* Little-endian helpers from the Linux driver; none of them needs an instance */
+    static void put_unaligned_le32(uint32_t val, void *p);
+    static void put_le16(uint16_t val, uint8_t *p);
+    static void put_le32(uint32_t val, uint8_t *p);
+    static UInt16 get_unaligned_le16(const void *p);
+    static UInt16 get_le16(const UInt8 *p);
 
     IOReturn u1_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag);
     IOReturn t4_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag);
