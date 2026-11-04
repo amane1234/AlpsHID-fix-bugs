@@ -40,11 +40,6 @@ bool AlpsHIDEventDriver::t4_device_init() {
         }
         sen_line_num_x = 16 + ((tmp & 0x0F) | (tmp & 0x08 ? 0xF0 : 0));
         sen_line_num_y = 12 + (((tmp & 0xF0) >> 4) | (tmp & 0x80 ? 0xF0 : 0));
-        ret = t4_read_write_register(PRM_SYS_CONFIG_1, &tmp, 0, true);
-        if (ret!=kIOReturnSuccess) {
-            IOLog("failed PRM_SYS_CONFIG_1 (%d)\n", ret);
-            goto exit;
-        }
     } else {
         sen_line_num_x = 20;
         sen_line_num_y = 12;
@@ -57,6 +52,12 @@ bool AlpsHIDEventDriver::t4_device_init() {
     pri_data.x_active_len_mm = pri_data.y_active_len_mm = 0;
     pri_data.btn_cnt = 1;
     
+    // Preserve unrelated configuration bits on every T4 variant, not only BTNLESS.
+    ret = t4_read_write_register(PRM_SYS_CONFIG_1, &tmp, 0, true);
+    if (ret != kIOReturnSuccess) {
+        IOLog("failed PRM_SYS_CONFIG_1 (%d)\n", ret);
+        goto exit;
+    }
     tmp |= 0x02;
     
     ret = t4_read_write_register(PRM_SYS_CONFIG_1, NULL, tmp, false);
@@ -464,7 +465,7 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         } else {
             transducer->isTransducerActive =  false;
             transducer->secondaryId = i;
-            transducer->currentCoordinates = transducer->previousCoordinates;
+            transducer->previousCoordinates = transducer->currentCoordinates;
             transducer->isPhysicalButtonDown = reportData.button;
         }
     }
@@ -514,10 +515,10 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     
     if(report_id==U1_ABSOLUTE_REPORT_ID || report_id==U1_ABSOLUTE_REPORT_ID_SECD) {
         
-        // The report length comes from the device: it used to be passed to readBytes() as-is, which
-        // overflowed this stack buffer for reports longer than the struct. Zero-fill covers shorter ones.
+        // All five fixed slots must be present. Zero-padding a truncated report would
+        // fabricate coordinates, button releases, and lifts for the missing contacts.
         u1_input_report reportData = {};
-        if (copyReport(report, &reportData, sizeof(reportData)) == 0)
+        if (copyReport(report, &reportData, sizeof(reportData)) != sizeof(reportData))
             return;
 #if DEBUG
         IOLog("%s::%s Getting touched\n",getName(),name);
@@ -553,7 +554,7 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
             } else {
                 transducer->isTransducerActive =  false;
                 transducer->secondaryId = i;
-                transducer->currentCoordinates = transducer->previousCoordinates;
+                transducer->previousCoordinates = transducer->currentCoordinates;
                 transducer->isPhysicalButtonDown = reportData.buttons;
             }
             
@@ -564,7 +565,9 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         spInputMessage.dy = 0;
         spInputMessage.buttons = reportData.buttons & 0x07;
         spInputMessage.timestamp=timestamp;
-        inputMessage.contact_count = contactCount;
+        // VoodooInput iterates this many array entries; contacts keep their hardware
+        // slot IDs, so active slots need not occupy the first contactCount entries.
+        inputMessage.contact_count = MAX_TOUCHES;
         inputMessage.timestamp = timestamp;
         
         if (contactCount >= 4 || inputMessage.transducers->isPhysicalButtonDown) {
@@ -980,3 +983,4 @@ void AlpsHIDEventDriver::handleClose(IOService *forClient, IOOptionBits options)
 
     super::handleClose(forClient, options);
 }
+
