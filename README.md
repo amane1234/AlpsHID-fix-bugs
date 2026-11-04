@@ -127,7 +127,7 @@ List of devices that match the ProductIDs above, found using http://linux-hardwa
 
 # Building AlpsHID
 
-To build --
+To build
 ```
 git clone https://github.com/blankmac/AlpsHID.git
 cd AlpsHID
@@ -139,7 +139,20 @@ Then add the MacKernel SDK.
 git clone https://github.com/acidanthera/MacKernelSDK.git
 ```
 
-Open the main project in Xcode and build away.  :)
+```
+xcodebuild \
+  -project AlpsHID.xcodeproj \
+  -target AlpsHID \
+  -configuration Release \
+  -sdk macosx \
+  ARCHS=x86_64 \
+  ONLY_ACTIVE_ARCH=NO \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGNING_REQUIRED=NO \
+  HEADER_SEARCH_PATHS='$(inherited) "$(PROJECT_DIR)/VoodooInput/VoodooInput/VoodooInputMultitouch"' \
+  CONFIGURATION_BUILD_DIR="$PWD/build/Release" \
+  clean build
+  ```
 
 # Credits
 This code is derived and adapted from VoodooI2CHID's Multitouch Event Driver and Precision
