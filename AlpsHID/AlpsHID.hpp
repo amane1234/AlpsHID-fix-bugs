@@ -217,6 +217,10 @@ private:
     bool awake = false;
     dev_num dev_type = U1;
 
+    // T4 sensor-dependent coordinate range, refreshed after every device reset.
+    UInt32 t4_y_max = 0;
+    UInt32 t4_y_min = T4_COUNT_PER_ELECTRODE;
+
     IOWorkLoop* work_loop = nullptr;
     IOCommandGate* command_gate = nullptr;
 
