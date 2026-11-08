@@ -4,6 +4,7 @@
 
 
 #include "AlpsHID.hpp"
+#include <IOKit/pwr_mgt/RootDomain.h>
 
 
 #define super IOHIDEventService
@@ -94,7 +95,18 @@ exit:
 }
 
 void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
-    
+ 
+        // Suppress Alps input reports while the lid is closed.
+    IOPMrootDomain *root = getPMRootDomain();
+    if (root) {
+        OSBoolean *state = OSDynamicCast(
+            OSBoolean,
+            root->getProperty("AppleClamshellState")
+        );
+        if (state == kOSBooleanTrue)
+            return;
+    }
+ 
     switch (dev_type) {
         case T4:
             t4_raw_event(timestamp, report, report_type, report_id);
