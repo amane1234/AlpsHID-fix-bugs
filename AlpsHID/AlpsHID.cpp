@@ -80,6 +80,10 @@ bool AlpsHIDEventDriver::t4_device_init() {
     }
     pri_data.max_fingers = 5;
 
+    // The Y range differs between T4 variants; use the probed geometry for inversion.
+    t4_y_max = pri_data.y_max;
+    t4_y_min = pri_data.y_min;
+
     setProperty(VOODOO_INPUT_LOGICAL_MAX_X_KEY, pri_data.x_max, 32);
     setProperty(VOODOO_INPUT_LOGICAL_MAX_Y_KEY, pri_data.y_max, 32);
     
@@ -419,7 +423,9 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     absolutetime_to_nanoseconds(now_abs, &now_ns);
     
     // Ignore touchpad interaction(s) shortly after typing
-    if (now_ns - key_time < max_after_typing)
+    // Avoid underflow when keyboard and touch timestamps arrive out of order.
+    if (key_time && now_ns >= key_time &&
+        now_ns - key_time < max_after_typing)
         return;
     
     if (!ready || !report || !voodooInputInstance)
@@ -437,13 +443,8 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     if (copyReport(report, &reportData, T4_INPUT_REPORT_LEN) != T4_INPUT_REPORT_LEN)
         return;
     
-    // When palm is detected just dont send anything.
-    // This is checked before any transducer is touched, so a dropped frame leaves no half-updated state.
-    for (int i = 0; i < MAX_TOUCHES; i++) {
-        if (reportData.contact[i].palm & 0x80)
-            return;
-    }
-    
+    // Reject palm contacts per slot. Dropping an entire report would keep
+    // previous contacts active and prevent other fingers from updating.
     unsigned int x, y;
     
     int contactCount = 0;
@@ -456,17 +457,25 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         
         x = reportData.contact[i].x_hi << 8 | reportData.contact[i].x_lo;
         y = reportData.contact[i].y_hi << 8 | reportData.contact[i].y_lo;
-        y = 3060 - y + 255;
+        // 0xffff denotes an empty contact in the ALPS T4 report format.
         bool contactValid = (reportData.contact[i].palm < 0x80 &&
-                             reportData.contact[i].palm > 0);
+                             reportData.contact[i].palm > 0 &&
+                             x != 0xffff);
         transducer->isValid = contactValid;
         transducer->timestamp = timestamp;
         transducer->supportsPressure = false;
         
         if (contactValid) {
+            // Invert within the detected hardware range; clamp malformed samples.
+            if (y < t4_y_min)
+                y = t4_y_min;
+            else if (y > t4_y_max)
+                y = t4_y_max;
+            y = t4_y_max + t4_y_min - y;
+
             transducer->isTransducerActive = true;
             transducer->secondaryId = i;
-            
+
             transducer->previousCoordinates = transducer->currentCoordinates;
             transducer->currentCoordinates.x = x;
             transducer->currentCoordinates.y = y;
@@ -485,11 +494,11 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     inputMessage.contact_count = MAX_TOUCHES;
     inputMessage.timestamp = timestamp;
     
-    if (contactCount >= 4 || inputMessage.transducers->isPhysicalButtonDown) {
+    if (contactCount >= 4 || reportData.button) {
         // simple thumb detection: to find the lowest finger touch in the vertical direction.
         // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
         UInt32 y_max = 0;
-        int thumb_index = 0;
+        int thumb_index = -1;
         for (int i = 0; i < MAX_TOUCHES; i++) {
             VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
             if (inputTransducer->isValid && inputTransducer->currentCoordinates.y >= y_max) {
@@ -497,7 +506,9 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
                 thumb_index = i;
             }
         }
-        inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
+        // Button-only reports have no valid thumb candidate.
+        if (thumb_index >= 0)
+            inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
     }
 
     super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance, &inputMessage, sizeof(VoodooInputEvent));
@@ -514,7 +525,9 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
 #endif
     
     // Ignore touchpad interaction(s) shortly after typing
-    if (now_ns - key_time < max_after_typing)
+    // Avoid underflow when keyboard and touch timestamps arrive out of order.
+    if (key_time && now_ns >= key_time &&
+        now_ns - key_time < max_after_typing)
         return;
     
     if (!ready || !report || !voodooInputInstance)
@@ -582,11 +595,11 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         inputMessage.contact_count = MAX_TOUCHES;
         inputMessage.timestamp = timestamp;
         
-        if (contactCount >= 4 || inputMessage.transducers->isPhysicalButtonDown) {
+        if (contactCount >= 4 || reportData.buttons) {
             // simple thumb detection: to find the lowest finger touch in the vertical direction.
             // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
             UInt32 y_max = 0;
-            int thumb_index = 0;
+            int thumb_index = -1;
             for (int i = 0; i < MAX_TOUCHES; i++) {
                 VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
                 if (inputTransducer->isValid && inputTransducer->currentCoordinates.y >= y_max) {
@@ -594,7 +607,8 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
                     thumb_index = i;
                 }
             }
-            inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
+            if (thumb_index >= 0)
+                inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
         }
         
         
