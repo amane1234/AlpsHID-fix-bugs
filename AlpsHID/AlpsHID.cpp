@@ -107,8 +107,10 @@ void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryD
             OSBoolean,
             root->getProperty("AppleClamshellState")
         );
-        if (state == kOSBooleanTrue)
+        if (state == kOSBooleanTrue) {
+            releaseInput(timestamp);
             return;
+        }
     }
  
     switch (dev_type) {
@@ -238,6 +240,9 @@ IOReturn AlpsHIDEventDriver::setPowerState(
     if (!whichState) {
         awake = false;
         ready = false;
+        AbsoluteTime timestamp;
+        clock_get_uptime(&timestamp);
+        releaseInput(timestamp);
 
         IOLog("%s::%s Going to sleep\n",
               getName(), name ? name : "unknown");
@@ -415,6 +420,32 @@ bool AlpsHIDEventDriver::didTerminate(IOService* provider, IOOptionBits options,
     return super::didTerminate(provider, options, defer);
 }
 
+// Release both endpoints before input is disabled. Clear cached source state
+// even if the VoodooInput client has already disconnected.
+void AlpsHIDEventDriver::releaseInput(AbsoluteTime timestamp) {
+    pad_buttons = stick_buttons = 0;
+    for (int i = 0; i < MAX_TOUCHES; ++i) {
+        VoodooInputTransducer& contact = inputMessage.transducers[i];
+        contact.isValid = contact.isTransducerActive ||
+            (contact.isValid && contact.isPhysicalButtonDown);
+        contact.isTransducerActive = false;
+        contact.isPhysicalButtonDown = false;
+        contact.type = VoodooInputTransducerType::FINGER;
+        contact.secondaryId = i;
+        contact.timestamp = timestamp;
+    }
+    inputMessage.contact_count = MAX_TOUCHES;
+    inputMessage.timestamp = timestamp;
+    spInputMessage = {};
+    spInputMessage.timestamp = timestamp;
+    if (voodooInputInstance) {
+        super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance,
+                             &inputMessage, sizeof(inputMessage));
+        super::messageClient(kIOMessageVoodooTrackpointRelativePointer, voodooInputInstance,
+                             &spInputMessage, sizeof(spInputMessage));
+    }
+}
+
 void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
     
     uint64_t now_abs;
@@ -422,11 +453,10 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     uint64_t now_ns;
     absolutetime_to_nanoseconds(now_abs, &now_ns);
     
-    // Ignore touchpad interaction(s) shortly after typing
-    // Avoid underflow when keyboard and touch timestamps arrive out of order.
-    if (key_time && now_ns >= key_time &&
-        now_ns - key_time < max_after_typing)
-        return;
+    // Suppress contacts, not the frame: releases and physical buttons must
+    // still reach VoodooInput. Stick reports are independent of typing.
+    const bool suppressContacts = key_time && now_ns >= key_time &&
+        now_ns - key_time < max_after_typing;
     
     if (!ready || !report || !voodooInputInstance)
         return;
@@ -460,8 +490,12 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         // 0xffff denotes an empty contact in the ALPS T4 report format.
         bool contactValid = (reportData.contact[i].palm < 0x80 &&
                              reportData.contact[i].palm > 0 &&
-                             x != 0xffff);
-        transducer->isValid = contactValid;
+                             x != 0xffff && !suppressContacts);
+        // Include lifts: VoodooInput skips isValid=false. Keep a previously
+        // reported clicking slot until button release, but never add unused
+        // slots just because a physical button is held.
+        transducer->isValid = contactValid || transducer->isTransducerActive ||
+            (transducer->isValid && transducer->isPhysicalButtonDown);
         transducer->timestamp = timestamp;
         transducer->supportsPressure = false;
         
@@ -501,7 +535,7 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         int thumb_index = -1;
         for (int i = 0; i < MAX_TOUCHES; i++) {
             VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
-            if (inputTransducer->isValid && inputTransducer->currentCoordinates.y >= y_max) {
+            if (inputTransducer->isTransducerActive && inputTransducer->currentCoordinates.y >= y_max) {
                 y_max = inputTransducer->currentCoordinates.y;
                 thumb_index = i;
             }
@@ -524,11 +558,10 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     IOLog("%s::%s Recieving report: %u\n",getName(),name,report_id);
 #endif
     
-    // Ignore touchpad interaction(s) shortly after typing
-    // Avoid underflow when keyboard and touch timestamps arrive out of order.
-    if (key_time && now_ns >= key_time &&
-        now_ns - key_time < max_after_typing)
-        return;
+    // Suppress contacts, not the frame: releases and physical buttons must
+    // still reach VoodooInput. Stick reports are independent of typing.
+    const bool suppressContacts = key_time && now_ns >= key_time &&
+        now_ns - key_time < max_after_typing;
     
     if (!ready || !report || !voodooInputInstance)
         return;
@@ -548,6 +581,7 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
 #if DEBUG
         IOLog("%s::%s Getting touched\n",getName(),name);
 #endif
+        const bool clickpadDown = u1_button_count == 1 && (reportData.buttons & 0x01);
         int contactCount = 0;
         for (int i = 0; i < MAX_TOUCHES; i++) {
             VoodooInputTransducer* transducer = &inputMessage.transducers[i];
@@ -559,8 +593,10 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
             x = reportData.contact[i].x_hi << 8 | reportData.contact[i].x_lo;
             y = reportData.contact[i].y_hi << 8 | reportData.contact[i].y_lo;
             z = reportData.contact[i].z & 0x7F;
-            bool contactValid = z;
-            transducer->isValid = contactValid;
+            bool contactValid = z != 0 && !suppressContacts;
+            // Include lifts, without creating unused contacts on a click.
+            transducer->isValid = contactValid || transducer->isTransducerActive ||
+                (transducer->isValid && transducer->isPhysicalButtonDown);
             transducer->timestamp = timestamp;
             transducer->supportsPressure = false;
             
@@ -573,36 +609,40 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
                 transducer->previousCoordinates = transducer->currentCoordinates;
                 transducer->currentCoordinates.x = x;
                 transducer->currentCoordinates.y = y;
-                transducer->isPhysicalButtonDown = reportData.buttons;
+                transducer->isPhysicalButtonDown = clickpadDown;
                 
                 contactCount += 1;
             } else {
                 transducer->isTransducerActive =  false;
                 transducer->secondaryId = i;
                 transducer->previousCoordinates = transducer->currentCoordinates;
-                transducer->isPhysicalButtonDown = reportData.buttons;
+                transducer->isPhysicalButtonDown = clickpadDown;
             }
             
             
         }
-        //send button commands as mouse input.
+        // A one-button pad uses the multitouch click path. Discrete buttons
+        // use the relative-pointer path, without synthesizing a left click.
+        // Both ALPS devices share that VoodooInput endpoint, so retain each
+        // source independently until that source reports its own release.
+        pad_buttons = reportData.buttons & (u1_button_count == 1 ? 0x06 : 0x07);
         spInputMessage.dx = 0;
         spInputMessage.dy = 0;
-        spInputMessage.buttons = reportData.buttons & 0x07;
+        spInputMessage.buttons = pad_buttons | stick_buttons;
         spInputMessage.timestamp=timestamp;
         // VoodooInput iterates this many array entries; contacts keep their hardware
         // slot IDs, so active slots need not occupy the first contactCount entries.
         inputMessage.contact_count = MAX_TOUCHES;
         inputMessage.timestamp = timestamp;
         
-        if (contactCount >= 4 || reportData.buttons) {
+        if (contactCount >= 4 || clickpadDown) {
             // simple thumb detection: to find the lowest finger touch in the vertical direction.
             // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
             UInt32 y_max = 0;
             int thumb_index = -1;
             for (int i = 0; i < MAX_TOUCHES; i++) {
                 VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
-                if (inputTransducer->isValid && inputTransducer->currentCoordinates.y >= y_max) {
+                if (inputTransducer->isTransducerActive && inputTransducer->currentCoordinates.y >= y_max) {
                     y_max = inputTransducer->currentCoordinates.y;
                     thumb_index = i;
                 }
@@ -618,6 +658,8 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     }
     
     if(report_id== U1_SP_ABSOLUTE_REPORT_ID){
+        if (!has_stick)
+            return;
         u1_sp_input_report reportData = {};
         // Same overflow as above (report->getLength() was used as the copy size). x and y are needed at least.
         if (copyReport(report, &reportData, sizeof(reportData)) < offsetof(struct u1_sp_input_report, z))
@@ -625,9 +667,11 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
 #if DEBUG
         IOLog("%s::%s Getting poked dx:%i, dy:%i \n", getName(), name, reportData.x, reportData.y);
 #endif
-        spInputMessage.dx = reportData.x/4;
-        spInputMessage.dy = reportData.y/4;
-        spInputMessage.buttons = reportData.buttons & 0x07;
+        // Linux hid-alps uses signed little-endian deltas in eighths.
+        spInputMessage.dx = (SInt16)get_unaligned_le16(&reportData.x) / 8;
+        spInputMessage.dy = (SInt16)get_unaligned_le16(&reportData.y) / 8;
+        stick_buttons = reportData.buttons & 0x07;
+        spInputMessage.buttons = pad_buttons | stick_buttons;
         spInputMessage.timestamp=timestamp;
         super::messageClient(kIOMessageVoodooTrackpointRelativePointer,voodooInputInstance,&spInputMessage, sizeof(RelativePointerEvent));
         return;
@@ -781,6 +825,8 @@ bool AlpsHIDEventDriver::u1_device_init() {
         VOODOO_INPUT_PHYSICAL_MAX_Y_KEY,
         pri_data.y_active_len_mm * 10, 32);
 
+    u1_button_count = pri_data.btn_cnt;
+    has_stick = pri_data.has_sp != 0;
     ready = true;
     return true;
 
@@ -1009,4 +1055,5 @@ void AlpsHIDEventDriver::handleClose(IOService *forClient, IOOptionBits options)
 
     super::handleClose(forClient, options);
 }
+
 
