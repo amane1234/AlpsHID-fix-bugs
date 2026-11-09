@@ -1,1059 +1,263 @@
 /*This code is derived and adapted from VoodooI2CHID's Multitouch Event Driver and Precision
- Touchpad Event Driver (https://github.com/alexandred/VoodooI2C) and the Linux kernel driver
- for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/hid/hid-alps.c) */
-
-
-#include "AlpsHID.hpp"
-#include <IOKit/pwr_mgt/RootDomain.h>
-
-
-#define super IOHIDEventService
-OSDefineMetaClassAndStructors(AlpsHIDEventDriver, IOHIDEventService);
-
-// Copies at most max_len bytes of a report into buffer, never more than the buffer can hold
-// (the report length is device-controlled), and returns the number of bytes copied.
-static UInt32 copyReport(IOMemoryDescriptor* report, void* buffer, UInt32 max_len) {
-    UInt64 available = report->getLength();
-    UInt32 len = available < max_len ? (UInt32)available : max_len;
-
-    return (UInt32)report->readBytes(0, buffer, len);
-}
-
-bool AlpsHIDEventDriver::t4_device_init() {
-    
-    ready = false;
-    
-    UInt8 tmp = '\0', sen_line_num_x, sen_line_num_y;
-    alps_dev pri_data = {};
-    IOReturn ret = kIOReturnSuccess;
-    
-    // hid_interface is cleared in didTerminate(); this is also called from the wake-up path,
-    // so a missing interface must not be dereferenced
-    if (!hid_interface) {
-        IOLog("%s::%s HID interface not found\n", getName(), name ? name : "unknown");
-        return false;
-    }
-    if (hid_interface->getProductID() == HID_PRODUCT_ID_T4_BTNLESS) {
-        ret = t4_read_write_register(T4_PRM_ID_CONFIG_3, &tmp, 0, true);
-        if (ret!=kIOReturnSuccess) {
-            IOLog("failed T4_PRM_ID_CONFIG_3 (%d)\n", ret);
-            goto exit;
-        }
-        sen_line_num_x = 16 + ((tmp & 0x0F) | (tmp & 0x08 ? 0xF0 : 0));
-        sen_line_num_y = 12 + (((tmp & 0xF0) >> 4) | (tmp & 0x80 ? 0xF0 : 0));
-    } else {
-        sen_line_num_x = 20;
-        sen_line_num_y = 12;
-    }
-    
-    pri_data.x_max = sen_line_num_x * T4_COUNT_PER_ELECTRODE;
-    pri_data.x_min = T4_COUNT_PER_ELECTRODE;
-    pri_data.y_max = sen_line_num_y * T4_COUNT_PER_ELECTRODE;
-    pri_data.y_min = T4_COUNT_PER_ELECTRODE;
-    pri_data.x_active_len_mm = pri_data.y_active_len_mm = 0;
-    pri_data.btn_cnt = 1;
-    
-    // Preserve unrelated configuration bits on every T4 variant, not only BTNLESS.
-    ret = t4_read_write_register(PRM_SYS_CONFIG_1, &tmp, 0, true);
-    if (ret != kIOReturnSuccess) {
-        IOLog("failed PRM_SYS_CONFIG_1 (%d)\n", ret);
-        goto exit;
-    }
-    tmp |= 0x02;
-    
-    ret = t4_read_write_register(PRM_SYS_CONFIG_1, NULL, tmp, false);
-    if (ret!=kIOReturnSuccess) {
-        IOLog("failed PRM_SYS_CONFIG_1 (%d)\n", ret);
-        goto exit;
-    }
-    
-    ret = t4_read_write_register(T4_PRM_FEED_CONFIG_1, NULL, T4_I2C_ABS, false);
-    if (ret!=kIOReturnSuccess) {
-        IOLog("failed T4_PRM_FEED_CONFIG_1 (%d)\n", ret);
-        goto exit;
-    }
-    
-    ret = t4_read_write_register(T4_PRM_FEED_CONFIG_4, NULL, T4_FEEDCFG4_ADVANCED_ABS_ENABLE, false);
-    if (ret!=kIOReturnSuccess) {
-        IOLog("failed T4_PRM_FEED_CONFIG_4 (%d)\n", ret);
-        goto exit;
-    }
-    pri_data.max_fingers = 5;
-
-    // The Y range differs between T4 variants; use the probed geometry for inversion.
-    t4_y_max = pri_data.y_max;
-    t4_y_min = pri_data.y_min;
-
-    setProperty(VOODOO_INPUT_LOGICAL_MAX_X_KEY, pri_data.x_max, 32);
-    setProperty(VOODOO_INPUT_LOGICAL_MAX_Y_KEY, pri_data.y_max, 32);
-    
-    setProperty(VOODOO_INPUT_PHYSICAL_MAX_X_KEY, 10240, 32);
-    setProperty(VOODOO_INPUT_PHYSICAL_MAX_Y_KEY, 6140, 32);
-    
-    ready = true;
-    return true;
-    
-exit:
-    ready = false;
-    return false;
-}
-
-void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
- 
-        // Suppress Alps input reports while the lid is closed.
-    IOPMrootDomain *root = getPMRootDomain();
-    if (root) {
-        OSBoolean *state = OSDynamicCast(
-            OSBoolean,
-            root->getProperty("AppleClamshellState")
-        );
-        if (state == kOSBooleanTrue) {
-            releaseInput(timestamp);
-            return;
-        }
-    }
- 
-    switch (dev_type) {
-        case T4:
-            t4_raw_event(timestamp, report, report_type, report_id);
-            break;
-        case U1:
-            u1_raw_event(timestamp, report, report_type, report_id);
-            break;
-    }
-}
-
-bool AlpsHIDEventDriver::start(IOService* provider) {
-    if (!super::start(provider))
-        return false;
-    
-    // super::start() has already run handleStart() (interface opened, power management registered).
-    // The framework does not call stop() when start() fails, so undo that via stop -> handleStop.
-    auto fail = [&]() -> bool {
-        super::stop(provider);
-        return false;
-    };
-    
-    work_loop = this->getWorkLoop();
-    
-    if (!work_loop)
-        return fail();
-    
-    work_loop->retain();
-    
-    command_gate = IOCommandGate::commandGate(this);
-    if (!command_gate) {
-        return fail();
-    }
-    
-    if (work_loop->addEventSource(command_gate) != kIOReturnSuccess) {
-        OSSafeReleaseNULL(command_gate);
-        return fail();
-    }
-    
-    max_after_typing = 500000000;
-    key_time = 0;
-    
-    // Read QuietTimeAfterTyping configuration value (if available)
-    OSNumber* quietTimeAfterTyping = OSDynamicCast(OSNumber, getProperty("QuietTimeAfterTyping"));
-    
-    if (quietTimeAfterTyping != NULL)
-        max_after_typing = quietTimeAfterTyping->unsigned64BitValue() * 1000000;
-    
-    setProperty("VoodooI2CServices Supported", kOSBooleanTrue);
-    
-    return true;
-}
-
-bool AlpsHIDEventDriver::handleStart(IOService* provider) {
-    
-    hid_interface = OSDynamicCast(IOHIDInterface, provider);
-    
-    if (!hid_interface)
-        return false;
-
-    if (hid_interface->getVendorID() != ALPS_VENDOR && hid_interface->getVendorID() != CIRQUE_VENDOR) {
-        hid_interface = NULL;
-        return false;
-    }
-
-    switch (hid_interface->getProductID()) {
-            
-        case HID_PRODUCT_ID_T4_USB:
-        case HID_PRODUCT_ID_T4_USB_2:
-        case HID_PRODUCT_ID_T4_USB_3:
-        case HID_PRODUCT_ID_T4_USB_4:
-        case HID_PRODUCT_ID_G1:
-        case HID_PRODUCT_ID_T4_BTNLESS:
-            dev_type = T4;
-            break;
-        case HID_PRODUCT_ID_U1:
-        case HID_PRODUCT_ID_U1_OLDMAN:
-        case HID_PRODUCT_ID_U1_UNICORN_LEGACY:
-        case HID_PRODUCT_ID_U1_DUAL:
-        case HID_PRODUCT_ID_U1_DUAL_PTP:
-        case HID_PRODUCT_ID_U1_PTP_1:
-        case HID_PRODUCT_ID_U1_PTP_2:
-        case HID_PRODUCT_ID_U1_DUAL_3BTN_PTP:
-        case HID_PRODUCT_ID_U1_1222:
-            dev_type = U1;
-            break;
-            
-        default:
-        {   hid_interface = NULL;
-            return false;
-        }
-     }
-    
-    
-    if (!hid_interface->open(this, 0, OSMemberFunctionCast(IOHIDInterface::InterruptReportAction, this, &AlpsHIDEventDriver::handleInterruptReport), NULL))
-        return false;
-    
-    // getProduct() returns an OSString*. It used to be cast to char* and then printed with %s,
-    // i.e. the OSString object itself was read as if it were the text.
-    OSString* product = hid_interface->getProduct();
-    name = product ? product->getCStringNoCopy() : "unknown";
-    
-    // Documented order: PMinit(), joinPMtree(), registerPowerDriver()
-    PMinit();
-    hid_interface->joinPMtree(this);
-    registerPowerDriver(this, VoodooI2CIOPMPowerStates, kVoodooI2CIOPMNumberPowerStates);
-    
-    if (!initialiseDeviceWithRetry(0))
-        IOLog("%s::%s Device initialisation failed, the touchpad stays disabled\n", getName(), name);
-    
-    publishMultitouchInterface();
-    
-    return true;
-}
-
-
-IOReturn AlpsHIDEventDriver::setPowerState(
-    unsigned long whichState,
-    IOService* whatDevice
-) {
-    // The return value of a setPowerState() callback is "microseconds until the change is complete"
-    // (kIOPMAckImplied == 0 means: done). An IOReturn error code here is read as an enormous delay.
-    if (whatDevice != this)
-        return kIOPMAckImplied;
-
-    if (!whichState) {
-        awake = false;
-        ready = false;
-        AbsoluteTime timestamp;
-        clock_get_uptime(&timestamp);
-        releaseInput(timestamp);
-
-        IOLog("%s::%s Going to sleep\n",
-              getName(), name ? name : "unknown");
-
-        return kIOPMAckImplied;
-    }
-
-    if (!awake) {
-        // After S4 the touchpad has lost power completely and needs noticeably longer than after S3
-        // before it answers feature reports again, so back off for up to ~2 s instead of giving up
-        // after ~0.1 s.
-        bool initialized = initialiseDeviceWithRetry(10);
-
-        // Do not mark the device as awake if initialization failed.
-        awake = initialized;
-
-        if (!initialized)
-            ready = false;
-    }
-
-    return kIOPMAckImplied;
-}
-
-bool AlpsHIDEventDriver::initialiseDevice() {
-    // hid_interface is cleared in didTerminate(), which can race with a wake-up
-    if (!hid_interface) {
-        ready = false;
-        return false;
-    }
-
-    switch (dev_type) {
-        case T4:
-            return t4_device_init();
-
-        case U1:
-            return u1_device_init();
-    }
-
-    ready = false;
-    return false;
-}
-
-bool AlpsHIDEventDriver::initialiseDeviceWithRetry(UInt32 first_delay_ms) {
-    // Delay (ms) before every further attempt: the firmware needs time to come back after a power loss
-    static const UInt32 retry_delays_ms[] = { 50, 100, 250, 500, 1000 };
-    const int attempts = 1 + (int)(sizeof(retry_delays_ms) / sizeof(retry_delays_ms[0]));
-
-    for (int attempt = 0; attempt < attempts; ++attempt) {
-        UInt32 delay_ms = attempt == 0 ? first_delay_ms : retry_delays_ms[attempt - 1];
-
-        if (delay_ms)
-            IOSleep(delay_ms);
-
-        // The device may have been terminated while we were waiting
-        if (!hid_interface)
-            break;
-
-        if (initialiseDevice()) {
-            IOLog("%s::%s Initialization succeeded "
-                  "(attempt %d/%d)\n",
-                  getName(), name ? name : "unknown",
-                  attempt + 1, attempts);
-            return true;
-        }
-
-        IOLog("%s::%s Initialization failed "
-              "(attempt %d/%d)\n",
-              getName(), name ? name : "unknown",
-              attempt + 1, attempts);
-    }
-
-    return false;
-}
-
-UInt16 AlpsHIDEventDriver::t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length)
-{
-    UInt16 sum1 = 0xFF, sum2 = 0xFF;
-    unsigned long i = 0;
-    
-    if (offset + length >= 50)
-        return 0;
-    
-    while (length > 0) {
-        unsigned long tlen = length > 20 ? 20 : length;
-        
-        length -= tlen;
-        
-        do {
-            sum1 += buffer[offset + i];
-            sum2 += sum1;
-            i++;
-        } while (--tlen > 0);
-        
-        sum1 = (sum1 & 0xFF) + (sum1 >> 8);
-        sum2 = (sum2 & 0xFF) + (sum2 >> 8);
-    }
-    
-    sum1 = (sum1 & 0xFF) + (sum1 >> 8);
-    sum2 = (sum2 & 0xFF) + (sum2 >> 8);
-    
-    return(sum2 << 8 | sum1);
-}
-
-IOReturn AlpsHIDEventDriver::publishMultitouchInterface() {
-    setProperty("IOFBTransform", 0ull, 32);
-    setProperty("VoodooInputSupported", kOSBooleanTrue);
-    
-    return kIOReturnSuccess;
-}
-
-void AlpsHIDEventDriver::handleStop(IOService* provider) {
-    ready = false;
-
-    if (command_gate) {
-        if (work_loop)
-            work_loop->removeEventSource(command_gate);
-
-        OSSafeReleaseNULL(command_gate);
-    }
-
-    OSSafeReleaseNULL(work_loop);
-
-    // didTerminate() already did this if the device went away; a plain stop still has to close it
-    if (hid_interface) {
-        hid_interface->close(this);
-        hid_interface = NULL;
-    }
-
-    OSSafeReleaseNULL(voodooInputInstance);
-
-    PMstop();
-    super::handleStop(provider);
-}
-
-IOReturn AlpsHIDEventDriver::message(UInt32 type, IOService* provider, void* argument)
-{
-    switch (type)
-    {
-        case kKeyboardKeyPressTime:
-        {
-            if (!argument)
-                return kIOReturnBadArgument;
-
-            //  Remember last time key was pressed
-            key_time = *((uint64_t*)argument);
-#if DEBUG
-            IOLog("%s::keyPressed = %llu\n", getName(), key_time);
-#endif
-            return kIOReturnSuccess;
-        }
-    }
-
-    // Don't swallow messages we don't handle ourselves
-    return super::message(type, provider, argument);
-}
-
-bool AlpsHIDEventDriver::init(OSDictionary *properties) {
-    if (!super::init(properties)) {
-        return false;
-    }
-
-    awake = true;
-    
-    return true;
-}
-
-
-bool AlpsHIDEventDriver::didTerminate(IOService* provider, IOOptionBits options, bool* defer) {
-    ready = false;
-
-    if (hid_interface)
-        hid_interface->close(this);
-    hid_interface = NULL;
-    
-    return super::didTerminate(provider, options, defer);
-}
-
-// Release both endpoints before input is disabled. Clear cached source state
-// even if the VoodooInput client has already disconnected.
-void AlpsHIDEventDriver::releaseInput(AbsoluteTime timestamp) {
-    pad_buttons = stick_buttons = 0;
-    for (int i = 0; i < MAX_TOUCHES; ++i) {
-        VoodooInputTransducer& contact = inputMessage.transducers[i];
-        contact.isValid = contact.isTransducerActive ||
-            (contact.isValid && contact.isPhysicalButtonDown);
-        contact.isTransducerActive = false;
-        contact.isPhysicalButtonDown = false;
-        contact.type = VoodooInputTransducerType::FINGER;
-        contact.secondaryId = i;
-        contact.timestamp = timestamp;
-    }
-    inputMessage.contact_count = MAX_TOUCHES;
-    inputMessage.timestamp = timestamp;
-    spInputMessage = {};
-    spInputMessage.timestamp = timestamp;
-    if (voodooInputInstance) {
-        super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance,
-                             &inputMessage, sizeof(inputMessage));
-        super::messageClient(kIOMessageVoodooTrackpointRelativePointer, voodooInputInstance,
-                             &spInputMessage, sizeof(spInputMessage));
-    }
-}
-
-void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
-    
-    uint64_t now_abs;
-    clock_get_uptime(&now_abs);
-    uint64_t now_ns;
-    absolutetime_to_nanoseconds(now_abs, &now_ns);
-    
-    // Suppress contacts, not the frame: releases and physical buttons must
-    // still reach VoodooInput. Stick reports are independent of typing.
-    const bool suppressContacts = key_time && now_ns >= key_time &&
-        now_ns - key_time < max_after_typing;
-    
-    if (!ready || !report || !voodooInputInstance)
-        return;
-    
-    if (report_type != kIOHIDReportTypeInput)
-        return;
-    
-    if (report_id != T4_INPUT_REPORT_ID)
-        return;
-    
-    // A report shorter than expected would leave the rest of reportData as uninitialised stack garbage
-    t4_input_report reportData = {};
-    
-    if (copyReport(report, &reportData, T4_INPUT_REPORT_LEN) != T4_INPUT_REPORT_LEN)
-        return;
-    
-    // Reject palm contacts per slot. Dropping an entire report would keep
-    // previous contacts active and prevent other fingers from updating.
-    unsigned int x, y;
-    
-    int contactCount = 0;
-    for (int i = 0; i < MAX_TOUCHES; i++) {
-        VoodooInputTransducer* transducer = &inputMessage.transducers[i];
-
-        transducer->fingerType = (MT2FingerType) (kMT2FingerTypeIndexFinger + (i % 4));
-        transducer->type = VoodooInputTransducerType::FINGER;
-        transducer->secondaryId = i;
-        
-        x = reportData.contact[i].x_hi << 8 | reportData.contact[i].x_lo;
-        y = reportData.contact[i].y_hi << 8 | reportData.contact[i].y_lo;
-        // 0xffff denotes an empty contact in the ALPS T4 report format.
-        bool contactValid = (reportData.contact[i].palm < 0x80 &&
-                             reportData.contact[i].palm > 0 &&
-                             x != 0xffff && !suppressContacts);
-        // Include lifts: VoodooInput skips isValid=false. Keep a previously
-        // reported clicking slot until button release, but never add unused
-        // slots just because a physical button is held.
-        transducer->isValid = contactValid || transducer->isTransducerActive ||
-            (transducer->isValid && transducer->isPhysicalButtonDown);
-        transducer->timestamp = timestamp;
-        transducer->supportsPressure = false;
-        
-        if (contactValid) {
-            // Invert within the detected hardware range; clamp malformed samples.
-            if (y < t4_y_min)
-                y = t4_y_min;
-            else if (y > t4_y_max)
-                y = t4_y_max;
-            y = t4_y_max + t4_y_min - y;
-
-            transducer->isTransducerActive = true;
-            transducer->secondaryId = i;
-
-            transducer->previousCoordinates = transducer->currentCoordinates;
-            transducer->currentCoordinates.x = x;
-            transducer->currentCoordinates.y = y;
-            
-            transducer->isPhysicalButtonDown = reportData.button;
-           
-            contactCount += 1;
-        } else {
-            transducer->isTransducerActive =  false;
-            transducer->secondaryId = i;
-            transducer->previousCoordinates = transducer->currentCoordinates;
-            transducer->isPhysicalButtonDown = reportData.button;
-        }
-    }
-    
-    inputMessage.contact_count = MAX_TOUCHES;
-    inputMessage.timestamp = timestamp;
-    
-    if (contactCount >= 4 || reportData.button) {
-        // simple thumb detection: to find the lowest finger touch in the vertical direction.
-        // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
-        UInt32 y_max = 0;
-        int thumb_index = -1;
-        for (int i = 0; i < MAX_TOUCHES; i++) {
-            VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
-            if (inputTransducer->isTransducerActive && inputTransducer->currentCoordinates.y >= y_max) {
-                y_max = inputTransducer->currentCoordinates.y;
-                thumb_index = i;
-            }
-        }
-        // Button-only reports have no valid thumb candidate.
-        if (thumb_index >= 0)
-            inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
-    }
-
-    super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance, &inputMessage, sizeof(VoodooInputEvent));
-}
-
-void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
-    
-    uint64_t now_abs;
-    clock_get_uptime(&now_abs);
-    uint64_t now_ns;
-    absolutetime_to_nanoseconds(now_abs, &now_ns);
-#if DEBUG
-    IOLog("%s::%s Recieving report: %u\n",getName(),name,report_id);
-#endif
-    
-    // Suppress contacts, not the frame: releases and physical buttons must
-    // still reach VoodooInput. Stick reports are independent of typing.
-    const bool suppressContacts = key_time && now_ns >= key_time &&
-        now_ns - key_time < max_after_typing;
-    
-    if (!ready || !report || !voodooInputInstance)
-        return;
-    
-    if (report_type != kIOHIDReportTypeInput)
-        return;
-    
-    unsigned int x, y, z;
-    
-    if(report_id==U1_ABSOLUTE_REPORT_ID || report_id==U1_ABSOLUTE_REPORT_ID_SECD) {
-        
-        // All five fixed slots must be present. Zero-padding a truncated report would
-        // fabricate coordinates, button releases, and lifts for the missing contacts.
-        u1_input_report reportData = {};
-        if (copyReport(report, &reportData, sizeof(reportData)) != sizeof(reportData))
-            return;
-#if DEBUG
-        IOLog("%s::%s Getting touched\n",getName(),name);
-#endif
-        const bool clickpadDown = u1_button_count == 1 && (reportData.buttons & 0x01);
-        int contactCount = 0;
-        for (int i = 0; i < MAX_TOUCHES; i++) {
-            VoodooInputTransducer* transducer = &inputMessage.transducers[i];
-            
-            transducer->type = VoodooInputTransducerType::FINGER;
-            transducer->fingerType = (MT2FingerType) (kMT2FingerTypeIndexFinger + (i % 4));
-            transducer->secondaryId = i;
-            
-            x = reportData.contact[i].x_hi << 8 | reportData.contact[i].x_lo;
-            y = reportData.contact[i].y_hi << 8 | reportData.contact[i].y_lo;
-            z = reportData.contact[i].z & 0x7F;
-            bool contactValid = z != 0 && !suppressContacts;
-            // Include lifts, without creating unused contacts on a click.
-            transducer->isValid = contactValid || transducer->isTransducerActive ||
-                (transducer->isValid && transducer->isPhysicalButtonDown);
-            transducer->timestamp = timestamp;
-            transducer->supportsPressure = false;
-            
-            if (contactValid) {
-                transducer->isTransducerActive = true;
-                transducer->secondaryId = i;
-#if DEBUG
-                IOLog("%s::%s Finger %i at(%u,%u)\n", getName(), name, i, x, y);
-#endif
-                transducer->previousCoordinates = transducer->currentCoordinates;
-                transducer->currentCoordinates.x = x;
-                transducer->currentCoordinates.y = y;
-                transducer->isPhysicalButtonDown = clickpadDown;
-                
-                contactCount += 1;
-            } else {
-                transducer->isTransducerActive =  false;
-                transducer->secondaryId = i;
-                transducer->previousCoordinates = transducer->currentCoordinates;
-                transducer->isPhysicalButtonDown = clickpadDown;
-            }
-            
-            
-        }
-        // A one-button pad uses the multitouch click path. Discrete buttons
-        // use the relative-pointer path, without synthesizing a left click.
-        // Both ALPS devices share that VoodooInput endpoint, so retain each
-        // source independently until that source reports its own release.
-        pad_buttons = reportData.buttons & (u1_button_count == 1 ? 0x06 : 0x07);
-        spInputMessage.dx = 0;
-        spInputMessage.dy = 0;
-        spInputMessage.buttons = pad_buttons | stick_buttons;
-        spInputMessage.timestamp=timestamp;
-        // VoodooInput iterates this many array entries; contacts keep their hardware
-        // slot IDs, so active slots need not occupy the first contactCount entries.
-        inputMessage.contact_count = MAX_TOUCHES;
-        inputMessage.timestamp = timestamp;
-        
-        if (contactCount >= 4 || clickpadDown) {
-            // simple thumb detection: to find the lowest finger touch in the vertical direction.
-            // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
-            UInt32 y_max = 0;
-            int thumb_index = -1;
-            for (int i = 0; i < MAX_TOUCHES; i++) {
-                VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
-                if (inputTransducer->isTransducerActive && inputTransducer->currentCoordinates.y >= y_max) {
-                    y_max = inputTransducer->currentCoordinates.y;
-                    thumb_index = i;
-                }
-            }
-            if (thumb_index >= 0)
-                inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
-        }
-        
-        
-        super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance, &inputMessage, sizeof(VoodooInputEvent));
-        super::messageClient(kIOMessageVoodooTrackpointRelativePointer,voodooInputInstance,&spInputMessage, sizeof(RelativePointerEvent));
-        return;
-    }
-    
-    if(report_id== U1_SP_ABSOLUTE_REPORT_ID){
-        if (!has_stick)
-            return;
-        u1_sp_input_report reportData = {};
-        // Same overflow as above (report->getLength() was used as the copy size). x and y are needed at least.
-        if (copyReport(report, &reportData, sizeof(reportData)) < offsetof(struct u1_sp_input_report, z))
-            return;
-#if DEBUG
-        IOLog("%s::%s Getting poked dx:%i, dy:%i \n", getName(), name, reportData.x, reportData.y);
-#endif
-        // Linux hid-alps uses signed little-endian deltas in eighths.
-        spInputMessage.dx = (SInt16)get_unaligned_le16(&reportData.x) / 8;
-        spInputMessage.dy = (SInt16)get_unaligned_le16(&reportData.y) / 8;
-        stick_buttons = reportData.buttons & 0x07;
-        spInputMessage.buttons = pad_buttons | stick_buttons;
-        spInputMessage.timestamp=timestamp;
-        super::messageClient(kIOMessageVoodooTrackpointRelativePointer,voodooInputInstance,&spInputMessage, sizeof(RelativePointerEvent));
-        return;
-    }
-    return;
-    
-}
-
-bool AlpsHIDEventDriver::u1_device_init() {
-    ready = false;
-
-    UInt8 tmp = 0;
-    UInt8 dev_ctrl = 0;
-    UInt8 sen_line_num_x = 0;
-    UInt8 sen_line_num_y = 0;
-    UInt8 pitch_x = 0;
-    UInt8 pitch_y = 0;
-    UInt8 resolution = 0;
-
-    alps_dev pri_data = {};
-    IOReturn ret = kIOReturnSuccess;
-
-    if (!hid_interface)
-        return false;
-
-    // Read device control register.
-    ret = u1_read_write_register(
-        ADDRESS_U1_DEV_CTRL_1, &dev_ctrl, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    dev_ctrl &= ~U1_DISABLE_DEV;
-    dev_ctrl |= U1_TP_ABS_MODE;
-
-    ret = u1_read_write_register(
-        ADDRESS_U1_DEV_CTRL_1, NULL, dev_ctrl, false);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    // Read sensor geometry.
-    ret = u1_read_write_register(
-        ADDRESS_U1_NUM_SENS_X, &sen_line_num_x, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    ret = u1_read_write_register(
-        ADDRESS_U1_NUM_SENS_Y, &sen_line_num_y, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    ret = u1_read_write_register(
-        ADDRESS_U1_PITCH_SENS_X, &pitch_x, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    ret = u1_read_write_register(
-        ADDRESS_U1_PITCH_SENS_Y, &pitch_y, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    ret = u1_read_write_register(
-        ADDRESS_U1_RESO_DWN_ABS, &resolution, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    // Reject invalid geometry before calculating coordinate ranges.
-    if (sen_line_num_x < 2 ||
-        sen_line_num_y < 2 ||
-        pitch_x == 0 ||
-        pitch_y == 0 ||
-        resolution == 0) {
-        IOLog(
-            "%s::%s Invalid U1 geometry: "
-            "sensors=%u,%u pitch=%u,%u resolution=%u\n",
-            getName(), name,
-            sen_line_num_x, sen_line_num_y,
-            pitch_x, pitch_y, resolution);
-
-        ret = kIOReturnError;
-        goto exit;
-    }
-
-    pri_data.x_active_len_mm =
-        pitch_x * (sen_line_num_x - 1);
-
-    pri_data.y_active_len_mm =
-        pitch_y * (sen_line_num_y - 1);
-
-    pri_data.x_max =
-        (resolution << 2) * (sen_line_num_x - 1);
-    pri_data.x_min = 1;
-
-    pri_data.y_max =
-        (resolution << 2) * (sen_line_num_y - 1);
-    pri_data.y_min = 1;
-
-    // Read button configuration.
-    ret = u1_read_write_register(
-        ADDRESS_U1_PAD_BTN, &tmp, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    if ((tmp & 0x0F) == ((tmp & 0xF0) >> 4))
-        pri_data.btn_cnt = tmp & 0x0F;
-    else
-        pri_data.btn_cnt = 1;
-
-    // Detect optional trackpoint support.
-    ret = u1_read_write_register(
-        ADDRESS_U1_DEVICE_TYP, &tmp, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    if (tmp & U1_DEVTYPE_SP_SUPPORT) {
-        dev_ctrl |= U1_SP_ABS_MODE;
-
-        ret = u1_read_write_register(
-            ADDRESS_U1_DEV_CTRL_1, NULL, dev_ctrl, false);
-
-        if (ret == kIOReturnSuccess) {
-            ret = u1_read_write_register(
-                ADDRESS_U1_SP_BTN,
-                &pri_data.sp_btn_info, 0, true);
-        }
-
-        if (ret == kIOReturnSuccess) {
-            pri_data.has_sp = 1;
-        } else {
-            // Trackpoint initialization is optional.
-            IOLog(
-                "%s::%s Trackpoint initialization failed: %d\n",
-                getName(), name, ret);
-
-            pri_data.has_sp = 0;
-        }
-    }
-
-    setProperty(
-        VOODOO_INPUT_LOGICAL_MAX_X_KEY,
-        pri_data.x_max, 32);
-
-    setProperty(
-        VOODOO_INPUT_LOGICAL_MAX_Y_KEY,
-        pri_data.y_max, 32);
-
-    setProperty(
-        VOODOO_INPUT_PHYSICAL_MAX_X_KEY,
-        pri_data.x_active_len_mm * 10, 32);
-
-    setProperty(
-        VOODOO_INPUT_PHYSICAL_MAX_Y_KEY,
-        pri_data.y_active_len_mm * 10, 32);
-
-    u1_button_count = pri_data.btn_cnt;
-    has_stick = pri_data.has_sp != 0;
-    ready = true;
-    return true;
-
-exit:
-    IOLog(
-        "%s::%s U1 initialization failed: %d\n",
-        getName(), name, ret);
-
-    ready = false;
-    return false;
-}
-
-IOReturn AlpsHIDEventDriver::u1_read_write_register(
-    UInt32 address,
-    UInt8 *read_val,
-    UInt8 write_val,
-    bool read_flag
-) {
-    if (!hid_interface || (read_flag && !read_val))
-        return kIOReturnBadArgument;
-
-    UInt8 check_sum = 0;
-    UInt8 input[U1_FEATURE_REPORT_LEN] = {};
-    UInt8 readbuf[U1_FEATURE_REPORT_LEN] = {};
-
-    input[0] = U1_FEATURE_REPORT_ID;
-
-    if (read_flag) {
-        input[1] = U1_CMD_REGISTER_READ;
-        input[6] = 0x00;
-    } else {
-        input[1] = U1_CMD_REGISTER_WRITE;
-        input[6] = write_val;
-    }
-
-    put_unaligned_le32(address, input + 2);
-
-    check_sum = U1_FEATURE_REPORT_LEN_ALL;
-    for (int i = 0; i < U1_FEATURE_REPORT_LEN - 1; ++i)
-        check_sum += input[i];
-
-    input[7] = check_sum;
-
-    // Hand the bytes straight to the descriptor (no intermediate OSData copy)
-    IOBufferMemoryDescriptor* report =
-        IOBufferMemoryDescriptor::withBytes(
-            input, sizeof(input), kIODirectionInOut);
-
-    if (!report)
-        return kIOReturnNoMemory;
-
-    IOReturn ret = hid_interface->setReport(
-        report, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
-
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    if (read_flag) {
-        ret = hid_interface->getReport(
-            report, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
-
-        if (ret != kIOReturnSuccess)
-            goto exit;
-
-        if (report->readBytes(0, readbuf, sizeof(readbuf))
-            != sizeof(readbuf)) {
-            ret = kIOReturnError;
-            goto exit;
-        }
-
-        *read_val = readbuf[6];
-    }
-
-exit:
-    report->release();
-    return ret;
-}
-
-IOReturn AlpsHIDEventDriver::t4_read_write_register(
-    UInt32 address,
-    UInt8 *read_val,
-    UInt8 write_val,
-    bool read_flag
-) {
-    if (!hid_interface || (read_flag && !read_val))
-        return kIOReturnBadArgument;
-
-    UInt16 check_sum = 0;
-    UInt8 input[T4_FEATURE_REPORT_LEN] = {};
-    UInt8 readbuf[T4_FEATURE_REPORT_LEN] = {};
-
-    input[0] = T4_FEATURE_REPORT_ID;
-    input[1] = read_flag
-        ? T4_CMD_REGISTER_READ
-        : T4_CMD_REGISTER_WRITE;
-
-    input[8] = read_flag ? 0x00 : write_val;
-
-    put_unaligned_le32(address, input + 2);
-    input[6] = 1;
-    input[7] = 0;
-
-    check_sum = t4_calc_check_sum(input, 1, 8);
-    input[9] = (UInt8)check_sum;
-    input[10] = (UInt8)(check_sum >> 8);
-    input[11] = 0;
-
-    // Hand the bytes straight to the descriptor (no intermediate OSData copy)
-    IOBufferMemoryDescriptor* report =
-        IOBufferMemoryDescriptor::withBytes(
-            input, sizeof(input), kIODirectionInOut);
-
-    if (!report)
-        return kIOReturnNoMemory;
-
-    IOReturn ret = hid_interface->setReport(
-        report, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
-
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    if (read_flag) {
-        ret = hid_interface->getReport(
-            report, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
-
-        if (ret != kIOReturnSuccess)
-            goto exit;
-
-        if (report->readBytes(0, readbuf, sizeof(readbuf))
-            != sizeof(readbuf)) {
-            ret = kIOReturnError;
-            goto exit;
-        }
-
-        UInt32 responseAddress =
-            (UInt32)readbuf[6] |
-            ((UInt32)readbuf[7] << 8) |
-            ((UInt32)readbuf[8] << 16) |
-            ((UInt32)readbuf[9] << 24);
-
-        if (responseAddress != address) {
-            IOLog("T4 register address mismatch "
-                  "(%x, %x)\n",
-                  responseAddress, address);
-            ret = kIOReturnError;
-            goto exit;
-        }
-
-        UInt16 responseSize = get_unaligned_le16(&readbuf[10]);
-
-        if (responseSize != 1) {
-            IOLog("T4 register size error (%x)\n",
-                  responseSize);
-            ret = kIOReturnError;
-            goto exit;
-        }
-
-        check_sum = t4_calc_check_sum(readbuf, 6, 7);
-
-        UInt16 responseChecksum =
-            get_unaligned_le16(&readbuf[13]);
-
-        if (responseChecksum != check_sum) {
-            IOLog("T4 register checksum error "
-                  "(%x, %x)\n",
-                  responseChecksum, check_sum);
-            ret = kIOReturnError;
-            goto exit;
-        }
-
-        *read_val = readbuf[12];
-    }
-
-exit:
-    report->release();
-    return ret;
-}
-
-
-void AlpsHIDEventDriver::put_unaligned_le32(uint32_t val, void *p)
-{
-    put_le32(val, (uint8_t*)p);
-}
-
-void AlpsHIDEventDriver::put_le16(uint16_t val, uint8_t *p)
-{
-    *p++ = val;
-    *p++ = val >> 8;
-}
-
-void AlpsHIDEventDriver::put_le32(uint32_t val, uint8_t *p)
-{
-    put_le16(val >> 16, p + 2);
-    put_le16(val, p);
-}
-
-UInt16 AlpsHIDEventDriver::get_unaligned_le16(const void *p)
-{
-    return get_le16((const UInt8 *)p);
-}
-
-UInt16 AlpsHIDEventDriver::get_le16(const UInt8 *p)
-{
-    return p[0] | p[1] << 8;
-}
-
-bool AlpsHIDEventDriver::handleOpen(IOService *forClient, IOOptionBits options, void *arg) {
-    if (forClient && forClient->getProperty(VOODOO_INPUT_IDENTIFIER)) {
-        // A second open must not leak the first retain
-        OSSafeReleaseNULL(voodooInputInstance);
-
-        voodooInputInstance = forClient;
-        voodooInputInstance->retain();
-        
-        return true;
-    }
-    
-    return super::handleOpen(forClient, options, arg);
-}
-
-void AlpsHIDEventDriver::handleClose(IOService *forClient, IOOptionBits options) {
-    // Any client can close: only drop the VoodooInput reference when it is VoodooInput that closes,
-    // otherwise the pointer used by the report handlers would dangle.
-    if (forClient == voodooInputInstance)
-        OSSafeReleaseNULL(voodooInputInstance);
-
-    super::handleClose(forClient, options);
-}
-
+Touchpad Event Driver (https://github.com/alexandred/VoodooI2C) and the Linux kernel driver
+for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/hid/hid-alps.c) */
+
+#ifndef AlpsHIDEventDriver_hpp
+#define AlpsHIDEventDriver_hpp
+
+// Keeps Apple's IOHIDEventDriver.h out of the build (this driver supplies its own event handling)
+#define _IOKIT_HID_IOHIDEVENTDRIVER_H
+
+#include <IOKit/IOLib.h>
+#include <IOKit/IOKitKeys.h>
+#include <IOKit/IOService.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOCommandGate.h>
+#include <IOKit/hid/IOHIDInterface.h>
+#include <kern/clock.h>
+
+#include <IOKit/hid/IOHIDEvent.h>
+#include <IOKit/hid/IOHIDEventService.h>
+#include <IOKit/hid/IOHIDEventTypes.h>
+#include <IOKit/hidsystem/IOHIDTypes.h>
+#include <IOKit/hid/IOHIDPrivateKeys.h>
+#include <IOKit/hid/IOHIDUsageTables.h>
+#include <IOKit/hid/IOHIDDevice.h>
+
+#include "../VoodooInput/VoodooInput/VoodooInputMultitouch/VoodooInputTransducer.h"
+#include "../VoodooInput/VoodooInput/VoodooInputMultitouch/VoodooInputMessages.h"
+#include "../VoodooInput/VoodooInput/Trackpoint/TrackpointDevice.hpp"
+
+#include "helpers.hpp"
+
+#define HID_PRODUCT_ID_T3_BTNLESS 0xD0C0
+#define HID_PRODUCT_ID_COSMO 0x1202
+#define HID_PRODUCT_ID_U1_DUAL 0x120B
+#define HID_PRODUCT_ID_T4_BTNLESS 0x120C
+#define HID_PRODUCT_ID_G1 0x120D
+#define HID_PRODUCT_ID_U1 0x1209
+#define HID_PRODUCT_ID_U1_UNICORN_LEGACY 0x121E
+#define HID_PRODUCT_ID_U1_OLDMAN 0x1215
+#define HID_PRODUCT_ID_T4_USB 0x1216
+#define HID_PRODUCT_ID_T4_USB_2 0x1217
+#define HID_PRODUCT_ID_T4_USB_3 0x120f
+#define HID_PRODUCT_ID_T4_USB_4 0x1218
+#define HID_PRODUCT_ID_U1_PTP_1 0x1207
+#define HID_PRODUCT_ID_U1_PTP_2 0x120A
+#define HID_PRODUCT_ID_U1_DUAL_PTP 0x121F
+#define HID_PRODUCT_ID_U1_DUAL_3BTN_PTP 0x1220
+#define HID_PRODUCT_ID_U1_1222 0x1222
+
+#define ALPS_VENDOR 0x44e
+#define CIRQUE_VENDOR 0x0488
+
+#define T4_INPUT_REPORT_LEN sizeof(struct t4_input_report)
+#define T4_FEATURE_REPORT_LEN T4_INPUT_REPORT_LEN
+#define T4_FEATURE_REPORT_ID 0x07
+#define T4_CMD_REGISTER_READ 0x08
+#define T4_CMD_REGISTER_WRITE 0x07
+#define T4_INPUT_REPORT_ID 0x09
+
+#define T4_ADDRESS_BASE 0xC2C0
+#define PRM_SYS_CONFIG_1 (T4_ADDRESS_BASE + 0x0002)
+#define T4_PRM_FEED_CONFIG_1 (T4_ADDRESS_BASE + 0x0004)
+#define T4_PRM_FEED_CONFIG_4 (T4_ADDRESS_BASE + 0x001A)
+#define T4_PRM_ID_CONFIG_3 (T4_ADDRESS_BASE + 0x00B0)
+#define T4_GPIO_PINS (T4_ADDRESS_BASE + 0x000C)
+
+#define T4_FEEDCFG4_ADVANCED_ABS_ENABLE 0x01
+#define T4_I2C_ABS 0x78
+#define T4_COUNT_PER_ELECTRODE 256
+
+/* Number of touches the driver reports to VoodooInput */
+#define MAX_TOUCHES 5
+
+/* Number of contact slots in the T4/U1 absolute reports as they come over the wire.
+ * This is fixed by the hardware report layout (see the packed structs below) and is deliberately NOT
+ * tied to MAX_TOUCHES. Code indexing contact[] must stay below it, e.g. with the max_fingers the device reports. */
+#define ALPS_REPORT_MAX_CONTACTS 5
+
+#define U1_MOUSE_REPORT_ID 0x01 /* Mouse data ReportID */
+#define U1_ABSOLUTE_REPORT_ID 0x03 /* Absolute data ReportID */
+#define U1_ABSOLUTE_REPORT_ID_SECD 0x02 /* FW-PTP Absolute data ReportID */
+#define U1_FEATURE_REPORT_ID 0x05 /* Feature ReportID */
+#define U1_SP_ABSOLUTE_REPORT_ID 0x06 /* SP (trackstick) absolute data ReportID */
+
+#define U1_FEATURE_REPORT_LEN 0x08 /* Feature Report Length */
+#define U1_FEATURE_REPORT_LEN_ALL 0x0A
+#define U1_CMD_REGISTER_READ 0xD1
+#define U1_CMD_REGISTER_WRITE 0xD2
+
+#define U1_DEVTYPE_SP_SUPPORT 0x10 /* SP Support */
+#define U1_DISABLE_DEV 0x01
+#define U1_TP_ABS_MODE 0x02
+#define U1_SP_ABS_MODE 0x80
+
+#define ADDRESS_U1_DEV_CTRL_1 0x00800040
+#define ADDRESS_U1_DEVICE_TYP 0x00800043
+#define ADDRESS_U1_NUM_SENS_X 0x00800047
+#define ADDRESS_U1_NUM_SENS_Y 0x00800048
+#define ADDRESS_U1_PITCH_SENS_X 0x00800049
+#define ADDRESS_U1_PITCH_SENS_Y 0x0080004A
+#define ADDRESS_U1_RESO_DWN_ABS 0x0080004E
+#define ADDRESS_U1_PAD_BTN 0x00800052
+#define ADDRESS_U1_SP_BTN 0x0080009F
+
+static_assert(MAX_TOUCHES <= ALPS_REPORT_MAX_CONTACTS, "MAX_TOUCHES cannot exceed the contact slots of the device reports");
+
+// Message types defined by ApplePS2Keyboard
+enum {
+    // from keyboard to mouse/touchpad
+    kKeyboardSetTouchStatus = iokit_vendor_specific_msg(100),   // set disable/enable touchpad (data is bool*)
+    kKeyboardGetTouchStatus = iokit_vendor_specific_msg(101),   // get disable/enable touchpad (data is bool*)
+    kKeyboardKeyPressTime = iokit_vendor_specific_msg(110)      // notify of timestamp a non-modifier key was pressed (data is uint64_t*)
+};
+
+enum dev_num {
+    U1,
+    T4,
+};
+
+struct alps_dev {
+    UInt8 max_fingers;
+    UInt8 has_sp;
+    UInt8 sp_btn_info;
+    UInt32 x_active_len_mm;
+    UInt32 y_active_len_mm;
+    UInt32 x_max;
+    UInt32 y_max;
+    UInt32 x_min;
+    UInt32 y_min;
+    UInt32 btn_cnt;
+    UInt32 sp_btn_cnt;
+};
+
+struct __attribute__((__packed__)) t4_contact_data {
+    UInt8 palm;
+    UInt8 x_lo;
+    UInt8 x_hi;
+    UInt8 y_lo;
+    UInt8 y_hi;
+};
+
+struct __attribute__((__packed__)) t4_input_report {
+    UInt8 reportID;
+    UInt8 numContacts;
+    struct t4_contact_data contact[ALPS_REPORT_MAX_CONTACTS];
+    UInt8 button;
+    UInt8 track[ALPS_REPORT_MAX_CONTACTS];
+    UInt8 zx[ALPS_REPORT_MAX_CONTACTS], zy[ALPS_REPORT_MAX_CONTACTS];
+    UInt8 palmTime[ALPS_REPORT_MAX_CONTACTS];
+    UInt8 kilroy;
+    UInt16 timeStamp;
+};
+
+struct __attribute__((__packed__)) u1_contact_data {
+    UInt8 x_lo;
+    UInt8 x_hi;
+    UInt8 y_lo;
+    UInt8 y_hi;
+    UInt8 z;
+};
+
+struct __attribute__((__packed__)) u1_input_report {
+    UInt8 reportID;
+    UInt8 buttons;
+    UInt8 numContacts;
+    struct u1_contact_data contact[ALPS_REPORT_MAX_CONTACTS];
+};
+
+struct __attribute__((__packed__)) u1_sp_input_report {
+    UInt8 reportID;
+    UInt8 buttons;
+    SInt16 x;
+    SInt16 y;
+    UInt16 z;
+};
+
+/* These structs are overlaid on raw device reports, so their size is part of the hardware protocol.
+ * A changed packing/field type would silently shift every field after it; fail the build instead. */
+static_assert(sizeof(struct t4_contact_data) == 5, "t4_contact_data must be 5 bytes");
+static_assert(sizeof(struct t4_input_report) == 51, "t4_input_report must be 51 bytes");
+static_assert(sizeof(struct u1_contact_data) == 5, "u1_contact_data must be 5 bytes");
+static_assert(sizeof(struct u1_input_report) == 28, "u1_input_report must be 28 bytes");
+static_assert(sizeof(struct u1_sp_input_report) == 8, "u1_sp_input_report must be 8 bytes");
+
+class AlpsHIDEventDriver : public IOHIDEventService {
+    OSDeclareDefaultStructors(AlpsHIDEventDriver);
+
+public:
+    void handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
+
+    bool init(OSDictionary *properties) override;
+    bool start(IOService* provider) override;
+    bool handleStart(IOService* provider) override;
+    void handleStop(IOService* provider) override;
+    bool handleOpen(IOService *forClient, IOOptionBits options, void *arg) override;
+    void handleClose(IOService *forClient, IOOptionBits options) override;
+    virtual IOReturn message(UInt32 type, IOService* provider, void* argument) override;
+    bool didTerminate(IOService* provider, IOOptionBits options, bool* defer) override;
+    IOReturn setPowerState(unsigned long whichState, IOService* whatDevice) override;
+
+    IOReturn publishMultitouchInterface();
+
+protected:
+    const char* name = nullptr;
+    IOHIDInterface* hid_interface = nullptr;
+
+private:
+    void t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
+    void u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
+
+    // Explicit initial values (IOKit zero-fills new objects, this just makes the intended state visible).
+    // ready/awake are written from the power/start path and read from the report callback.
+    bool ready = false;
+    uint64_t max_after_typing = 0;
+    uint64_t key_time = 0;
+    bool awake = false;
+    dev_num dev_type = U1;
+
+    // T4 sensor-dependent coordinate range, refreshed after every device reset.
+    UInt32 t4_y_max = 0;
+    UInt32 t4_y_min = T4_COUNT_PER_ELECTRODE;
+
+    IOWorkLoop* work_loop = nullptr;
+    IOCommandGate* command_gate = nullptr;
+
+    VoodooInputEvent inputMessage = {};
+    RelativePointerEvent spInputMessage = {};
+    UInt32 u1_button_count = 0;
+    bool has_stick = false;
+    UInt8 pad_buttons = 0;
+    UInt8 stick_buttons = 0;
+    void releaseInput(AbsoluteTime timestamp);
+
+    IOService* voodooInputInstance = nullptr;
+
+    UInt16 t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length);
+
+    /* Sends a report to the device to instruct it to enter Touchpad mode. They return whether the
+     * device is now ready (and set `ready` accordingly). */
+    bool t4_device_init();
+    bool u1_device_init();
+
+    /* Picks t4_/u1_device_init() by dev_type (and refuses to run once hid_interface is gone) */
+    bool initialiseDevice();
+
+    /* initialiseDevice() with back-off: the touchpad needs time to answer after a power loss (S4).
+     * first_delay_ms is the settle time before the first attempt. */
+    bool initialiseDeviceWithRetry(UInt32 first_delay_ms);
+
+    /* Little-endian helpers from the Linux driver; none of them needs an instance */
+    static void put_unaligned_le32(uint32_t val, void *p);
+    static void put_le16(uint16_t val, uint8_t *p);
+    static void put_le32(uint32_t val, uint8_t *p);
+    static UInt16 get_unaligned_le16(const void *p);
+    static UInt16 get_le16(const UInt8 *p);
+
+    IOReturn u1_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag);
+    IOReturn t4_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag);
+};
+
+#endif /* AlpsHIDEventDriver_hpp */
 
