@@ -12,7 +12,8 @@ for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
-#include <IOKit/IOCommandGate.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/hid/IOHIDInterface.h>
 #include <kern/clock.h>
 
@@ -189,7 +190,7 @@ class AlpsHIDEventDriver : public IOHIDEventService {
 public:
     void handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
 
-    bool init(OSDictionary *properties) override;
+    void free() override;
     bool start(IOService* provider) override;
     bool handleStart(IOService* provider) override;
     void handleStop(IOService* provider) override;
@@ -210,22 +211,36 @@ private:
     void u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
 
     // Explicit initial values (IOKit zero-fills new objects, this just makes the intended state visible).
-    // ready/awake are written from the power/start path and read from the report callback.
     bool ready = false;
     uint64_t max_after_typing = 0;
     uint64_t key_time = 0;
-    bool awake = false;
+    bool isReady() const { return __atomic_load_n(&ready, __ATOMIC_ACQUIRE); }
+    void setReady(bool value) { __atomic_store_n(&ready, value, __ATOMIC_RELEASE); }
     dev_num dev_type = U1;
 
     // T4 sensor-dependent coordinate range, refreshed after every device reset.
     UInt32 t4_y_max = 0;
     UInt32 t4_y_min = T4_COUNT_PER_ELECTRODE;
 
-    IOWorkLoop* work_loop = nullptr;
-    IOCommandGate* command_gate = nullptr;
+    // Serializes power transitions and register I/O independently of the HID transport loop.
+    IOWorkLoop* recovery_loop = nullptr;
+    IOTimerEventSource* wake_timer = nullptr;
+    unsigned wake_attempt = 0;
 
-    VoodooInputEvent inputMessage;
-    RelativePointerEvent spInputMessage;
+    enum class RecoveryAction { InitialStart, PowerOn, PowerOff, Stop };
+    RecoveryAction power_state = RecoveryAction::InitialStart;
+    void updateRecovery(RecoveryAction action);
+    void updateRecoveryGated(RecoveryAction action);
+    static void wakeTimerFired(OSObject* owner, IOTimerEventSource* timer);
+    void scheduleWakeAttempt();
+
+    VoodooInputEvent inputMessage = {};
+    RelativePointerEvent spInputMessage = {};
+    UInt32 u1_button_count = 0;
+    bool has_stick = false;
+    UInt8 pad_buttons = 0;
+    UInt8 stick_buttons = 0;
+    void releaseInput(AbsoluteTime timestamp);
 
     IOService* voodooInputInstance = nullptr;
 
