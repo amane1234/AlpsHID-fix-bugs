@@ -14,6 +14,7 @@ for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/hid/IOHIDInterface.h>
 #include <kern/clock.h>
 
@@ -196,6 +197,7 @@ public:
     void handleStop(IOService* provider) override;
     bool handleOpen(IOService *forClient, IOOptionBits options, void *arg) override;
     void handleClose(IOService *forClient, IOOptionBits options) override;
+    bool handleIsOpen(const IOService *forClient) const override;
     virtual IOReturn message(UInt32 type, IOService* provider, void* argument) override;
     bool didTerminate(IOService* provider, IOOptionBits options, bool* defer) override;
     IOReturn setPowerState(unsigned long whichState, IOService* whatDevice) override;
@@ -243,6 +245,11 @@ private:
     void releaseInput(AbsoluteTime timestamp);
 
     IOService* voodooInputInstance = nullptr;
+
+    // Serializes input state (inputMessage, spInputMessage, button caches) and voodooInputInstance
+    // between the HID interrupt path, the recovery work loop and VoodooInput open/close.
+    IOLock* input_lock = nullptr;
+    void releaseInputLocked(AbsoluteTime timestamp);
 
     UInt16 t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length);
 

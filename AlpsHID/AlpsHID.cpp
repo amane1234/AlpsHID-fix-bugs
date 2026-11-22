@@ -113,6 +113,12 @@ void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryD
         }
     }
 
+    if (!input_lock)
+        return;
+
+    // Reports arrive on the HID transport's thread, while releaseInput() runs on the recovery loop
+    // and VoodooInput can open/close at any time: all of them touch the same input state.
+    IOLockLock(input_lock);
     switch (dev_type) {
         case T4:
             t4_raw_event(timestamp, report, report_type, report_id);
@@ -121,6 +127,7 @@ void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryD
             u1_raw_event(timestamp, report, report_type, report_id);
             break;
     }
+    IOLockUnlock(input_lock);
 }
 
 bool AlpsHIDEventDriver::start(IOService* provider) {
@@ -177,6 +184,10 @@ bool AlpsHIDEventDriver::handleStart(IOService* provider) {
         default:
             return false;
     }
+
+    input_lock = IOLockAlloc();
+    if (!input_lock)
+        return false;
 
     recovery_loop = IOWorkLoop::workLoop();
     if (!recovery_loop)
@@ -260,7 +271,8 @@ void AlpsHIDEventDriver::updateRecoveryGated(RecoveryAction action) {
 
         case RecoveryAction::PowerOff: {
             power_state = action;
-            wake_timer->cancelTimeout();
+            if (wake_timer)
+                wake_timer->cancelTimeout();
             wake_attempt = 0;
             setReady(false);
             AbsoluteTime timestamp;
@@ -399,7 +411,13 @@ IOReturn AlpsHIDEventDriver::publishMultitouchInterface() {
 void AlpsHIDEventDriver::handleStop(IOService* provider) {
     updateRecovery(RecoveryAction::Stop);
 
-    OSSafeReleaseNULL(voodooInputInstance);
+    if (input_lock) {
+        IOLockLock(input_lock);
+        OSSafeReleaseNULL(voodooInputInstance);
+        IOLockUnlock(input_lock);
+    } else {
+        OSSafeReleaseNULL(voodooInputInstance);
+    }
 
     PMstop();
     super::handleStop(provider);
@@ -433,6 +451,11 @@ void AlpsHIDEventDriver::free() {
         recovery_loop->removeEventSource(wake_timer);
     OSSafeReleaseNULL(wake_timer);
     OSSafeReleaseNULL(recovery_loop);
+    OSSafeReleaseNULL(voodooInputInstance);
+    if (input_lock) {
+        IOLockFree(input_lock);
+        input_lock = nullptr;
+    }
     super::free();
 }
 
@@ -445,6 +468,14 @@ bool AlpsHIDEventDriver::didTerminate(IOService* provider, IOOptionBits options,
 // Release both endpoints before input is disabled. Clear cached source state
 // even if the VoodooInput client has already disconnected.
 void AlpsHIDEventDriver::releaseInput(AbsoluteTime timestamp) {
+    if (!input_lock)
+        return;
+    IOLockLock(input_lock);
+    releaseInputLocked(timestamp);
+    IOLockUnlock(input_lock);
+}
+
+void AlpsHIDEventDriver::releaseInputLocked(AbsoluteTime timestamp) {
     pad_buttons = stick_buttons = 0;
     for (int i = 0; i < MAX_TOUCHES; ++i) {
         VoodooInputTransducer& contact = inputMessage.transducers[i];
@@ -907,17 +938,28 @@ IOReturn AlpsHIDEventDriver::u1_read_write_register(
         goto exit;
 
     if (read_flag) {
+        // Read into a fresh, zeroed descriptor (as Linux does with its own readbuf): reusing the
+        // request buffer made a short/empty reply return the request bytes as register data.
+        IOBufferMemoryDescriptor* response =
+            IOBufferMemoryDescriptor::withBytes(
+                readbuf, sizeof(readbuf), kIODirectionInOut);
+
+        if (!response) {
+            ret = kIOReturnNoMemory;
+            goto exit;
+        }
+
         ret = hid_interface->getReport(
-            report, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
+            response, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
+
+        if (ret == kIOReturnSuccess &&
+            response->readBytes(0, readbuf, sizeof(readbuf)) != sizeof(readbuf))
+            ret = kIOReturnError;
+
+        response->release();
 
         if (ret != kIOReturnSuccess)
             goto exit;
-
-        if (report->readBytes(0, readbuf, sizeof(readbuf))
-            != sizeof(readbuf)) {
-            ret = kIOReturnError;
-            goto exit;
-        }
 
         *read_val = readbuf[6];
     }
@@ -971,17 +1013,28 @@ IOReturn AlpsHIDEventDriver::t4_read_write_register(
         goto exit;
 
     if (read_flag) {
+        // Read into a fresh, zeroed descriptor (as Linux does with its own readbuf): reusing the
+        // request buffer made a short/empty reply return the request bytes as register data.
+        IOBufferMemoryDescriptor* response =
+            IOBufferMemoryDescriptor::withBytes(
+                readbuf, sizeof(readbuf), kIODirectionInOut);
+
+        if (!response) {
+            ret = kIOReturnNoMemory;
+            goto exit;
+        }
+
         ret = hid_interface->getReport(
-            report, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
+            response, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
+
+        if (ret == kIOReturnSuccess &&
+            response->readBytes(0, readbuf, sizeof(readbuf)) != sizeof(readbuf))
+            ret = kIOReturnError;
+
+        response->release();
 
         if (ret != kIOReturnSuccess)
             goto exit;
-
-        if (report->readBytes(0, readbuf, sizeof(readbuf))
-            != sizeof(readbuf)) {
-            ret = kIOReturnError;
-            goto exit;
-        }
 
         UInt32 responseAddress =
             (UInt32)readbuf[6] |
@@ -1057,12 +1110,17 @@ UInt16 AlpsHIDEventDriver::get_le16(const UInt8 *p)
 
 bool AlpsHIDEventDriver::handleOpen(IOService *forClient, IOOptionBits options, void *arg) {
     if (forClient && forClient->getProperty(VOODOO_INPUT_IDENTIFIER)) {
+        forClient->retain();
+
+        if (input_lock)
+            IOLockLock(input_lock);
         // A second open must not leak the first retain
-        OSSafeReleaseNULL(voodooInputInstance);
-
+        IOService* previous = voodooInputInstance;
         voodooInputInstance = forClient;
-        voodooInputInstance->retain();
+        if (input_lock)
+            IOLockUnlock(input_lock);
 
+        OSSafeReleaseNULL(previous);
         return true;
     }
 
@@ -1072,8 +1130,32 @@ bool AlpsHIDEventDriver::handleOpen(IOService *forClient, IOOptionBits options, 
 void AlpsHIDEventDriver::handleClose(IOService *forClient, IOOptionBits options) {
     // Any client can close: only drop the VoodooInput reference when it is VoodooInput that closes,
     // otherwise the pointer used by the report handlers would dangle.
-    if (forClient == voodooInputInstance)
-        OSSafeReleaseNULL(voodooInputInstance);
+    if (forClient && forClient == voodooInputInstance) {
+        if (input_lock)
+            IOLockLock(input_lock);
+        IOService* previous = voodooInputInstance;
+        voodooInputInstance = nullptr;
+        if (input_lock)
+            IOLockUnlock(input_lock);
+
+        OSSafeReleaseNULL(previous);
+        // VoodooInput was never registered with IOHIDEventService::handleOpen()
+        return;
+    }
 
     super::handleClose(forClient, options);
+}
+
+// IOService::close() only calls handleClose() when handleIsOpen() says the client is open.
+// VoodooInput is opened outside IOHIDEventService's bookkeeping, so without this override its
+// close() was ignored: the retain leaked and the report handlers kept messaging a stopped client.
+bool AlpsHIDEventDriver::handleIsOpen(const IOService *forClient) const {
+    if (forClient == nullptr) {
+        if (voodooInputInstance)
+            return true;
+    } else if (forClient == voodooInputInstance) {
+        return true;
+    }
+
+    return super::handleIsOpen(forClient);
 }
