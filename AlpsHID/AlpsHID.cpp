@@ -100,18 +100,11 @@ exit:
 
 void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
 
-        // Suppress Alps input reports while the lid is closed.
+    // Suppress Alps input reports while the lid is closed.
+    bool lidClosed = false;
     IOPMrootDomain *root = getPMRootDomain();
-    if (root) {
-        OSBoolean *state = OSDynamicCast(
-            OSBoolean,
-            root->getProperty("AppleClamshellState")
-        );
-        if (state == kOSBooleanTrue) {
-            releaseInput(timestamp);
-            return;
-        }
-    }
+    if (root)
+        lidClosed = OSDynamicCast(OSBoolean, root->getProperty("AppleClamshellState")) == kOSBooleanTrue;
 
     if (!input_lock)
         return;
@@ -119,6 +112,18 @@ void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryD
     // Reports arrive on the HID transport's thread, while releaseInput() runs on the recovery loop
     // and VoodooInput can open/close at any time: all of them touch the same input state.
     IOLockLock(input_lock);
+    if (lidClosed) {
+        // Lift fingers and buttons once; every later report while the lid stays closed is just dropped
+        // (it used to send a full release to VoodooInput for each of them)
+        if (!lid_released) {
+            releaseInputLocked(timestamp);
+            lid_released = true;
+        }
+        IOLockUnlock(input_lock);
+        return;
+    }
+    lid_released = false;
+
     switch (dev_type) {
         case T4:
             t4_raw_event(timestamp, report, report_type, report_id);
@@ -427,6 +432,40 @@ IOReturn AlpsHIDEventDriver::message(UInt32 type, IOService* provider, void* arg
 {
     switch (type)
     {
+        // VoodooPS2Keyboard's touchpad on/off key. These were declared but never handled, so the key did nothing.
+        case kKeyboardGetTouchStatus:
+        {
+            if (!argument)
+                return kIOReturnBadArgument;
+            *static_cast<bool*>(argument) = !touchpad_disabled;
+            return kIOReturnSuccess;
+        }
+
+        case kKeyboardSetTouchStatus:
+        {
+            if (!argument)
+                return kIOReturnBadArgument;
+            bool enable = *static_cast<bool*>(argument);
+            IOLog("%s::%s Touchpad %s by keyboard\n", getName(), name ? name : "unknown", enable ? "enabled" : "disabled");
+            if (input_lock) {
+                IOLockLock(input_lock);
+                touchpad_disabled = !enable;
+                // Lift the fingers right away instead of waiting for the next report
+                if (!enable && !touchpad_released) {
+                    AbsoluteTime timestamp;
+                    clock_get_uptime(&timestamp);
+                    releaseInputLocked(timestamp);
+                    touchpad_released = true;
+                }
+                if (enable)
+                    touchpad_released = false;
+                IOLockUnlock(input_lock);
+            } else {
+                touchpad_disabled = !enable;
+            }
+            return kIOReturnSuccess;
+        }
+
         case kKeyboardKeyPressTime:
         {
             if (!argument)
@@ -463,6 +502,20 @@ bool AlpsHIDEventDriver::didTerminate(IOService* provider, IOOptionBits options,
     updateRecovery(RecoveryAction::Stop);
 
     return super::didTerminate(provider, options, defer);
+}
+
+// Called with input_lock held for every touchpad report: drops it while the touchpad is switched off,
+// releasing the contacts once.
+bool AlpsHIDEventDriver::dropTouchpadReportLocked(AbsoluteTime timestamp) {
+    if (!touchpad_disabled) {
+        touchpad_released = false;
+        return false;
+    }
+    if (!touchpad_released) {
+        releaseInputLocked(timestamp);
+        touchpad_released = true;
+    }
+    return true;
 }
 
 // Release both endpoints before input is disabled. Clear cached source state
@@ -518,6 +571,9 @@ void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
         return;
 
     if (report_id != T4_INPUT_REPORT_ID)
+        return;
+
+    if (dropTouchpadReportLocked(timestamp))
         return;
 
     // A report shorter than expected would leave the rest of reportData as uninitialised stack garbage
@@ -625,6 +681,9 @@ void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor
     unsigned int x, y, z;
 
     if(report_id==U1_ABSOLUTE_REPORT_ID || report_id==U1_ABSOLUTE_REPORT_ID_SECD) {
+        // Only the touchpad is switched off; trackpoint reports below are still handled
+        if (dropTouchpadReportLocked(timestamp))
+            return;
 
         // All five fixed slots must be present. Zero-padding a truncated report would
         // fabricate coordinates, button releases, and lifts for the missing contacts.

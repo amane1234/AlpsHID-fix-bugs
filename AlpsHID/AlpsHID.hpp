@@ -216,6 +216,15 @@ private:
     bool ready = false;
     uint64_t max_after_typing = 0;
     uint64_t key_time = 0;
+
+    // Touchpad switched off with the keyboard's touchpad key (kKeyboardSetTouchStatus from VoodooPS2Keyboard).
+    // The trackpoint keeps working.
+    volatile bool touchpad_disabled = false;
+    // Input was already released for the closed lid / the disabled touchpad, so that it is not sent again
+    // with every report. Both are protected by input_lock.
+    bool lid_released = false;
+    bool touchpad_released = false;
+    bool dropTouchpadReportLocked(AbsoluteTime timestamp);
     bool isReady() const { return __atomic_load_n(&ready, __ATOMIC_ACQUIRE); }
     void setReady(bool value) { __atomic_store_n(&ready, value, __ATOMIC_RELEASE); }
     dev_num dev_type = U1;
