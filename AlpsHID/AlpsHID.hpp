@@ -235,6 +235,7 @@ private:
     bool delivering = false;
     Delivery* reserveDeliveryLocked(bool release = false);
     void unlockAndDeliver();
+    void discardDeliveries();
     void setPointerLocked(Delivery* event, AbsoluteTime timestamp, SInt32 dx, SInt32 dy);
     UInt8 sent_buttons = 0;
     int previous_thumb = -1;

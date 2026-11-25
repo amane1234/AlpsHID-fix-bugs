@@ -549,6 +549,7 @@ void AlpsHIDEventDriver::free() {
         lid_notifier->remove();
         lid_notifier = nullptr;
     }
+    discardDeliveries();
     OSSafeReleaseNULL(feature_buffer);
     // Keep the loop alive through the final PM/termination callbacks and partial starts.
     if (wake_timer && wake_timer->getWorkLoop())
@@ -643,6 +644,19 @@ void AlpsHIDEventDriver::unlockAndDeliver() {
     }
     delivering = false;
     IOLockUnlock(input_lock);
+}
+
+// Nothing can deliver any more: drop queued snapshots and their client references. Every queued
+// event is normally delivered by the caller that queued it, so this only covers a partial start.
+void AlpsHIDEventDriver::discardDeliveries() {
+    while (delivery_head) {
+        auto* event = delivery_head;
+        delivery_head = event->next;
+        OSSafeReleaseNULL(event->client);
+        if (event != &first_delivery && event != &release_delivery)
+            IOFree(event, sizeof(Delivery));
+    }
+    delivery_tail = nullptr;
 }
 
 void AlpsHIDEventDriver::setPointerLocked(Delivery* event, AbsoluteTime timestamp, SInt32 dx, SInt32 dy) {
@@ -943,6 +957,12 @@ exit:
 // Only the recovery work loop calls register I/O. getReport/setReport are
 // synchronous and the descriptor belongs to this device for its lifetime.
 IOReturn AlpsHIDEventDriver::exchangeFeature(UInt8 id, UInt8* bytes, size_t size, bool read) {
+    if (!hid_interface || !bytes || !size)
+        return kIOReturnBadArgument;
+    // The buffer is sized by the first request. setLength() beyond the capacity is invalid, so
+    // replace it if a larger report ever comes along (T4 and U1 use different lengths).
+    if (feature_buffer && feature_buffer->getCapacity() < size)
+        OSSafeReleaseNULL(feature_buffer);
     if (!feature_buffer) {
         feature_buffer = new AlpsFeatureBuffer;
         if (!feature_buffer || !feature_buffer->initWithPhysicalMask(kernel_task, kIODirectionInOut, size, 1, 0)) {
@@ -967,7 +987,7 @@ IOReturn AlpsHIDEventDriver::exchangeFeature(UInt8 id, UInt8* bytes, size_t size
     // Some transports leave the descriptor length at capacity. Clearing the
     // request first also catches empty replies and avoids reusing stale data.
     unsigned needed = id == T4_FEATURE_REPORT_ID ? 15 : U1_FEATURE_REPORT_LEN;
-    if (!feature_buffer->covers(needed) || data[0] != id)
+    if (needed > size || !feature_buffer->covers(needed) || data[0] != id)
         return kIOReturnIOError;
     memcpy(bytes, data, needed);
     return kIOReturnSuccess;
