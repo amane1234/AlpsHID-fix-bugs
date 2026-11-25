@@ -1,0 +1,33 @@
+name: Protocol tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Unit tests and fuzzing
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang with libFuzzer
+        run: sudo apt-get update && sudo apt-get install -y clang-18 libclang-rt-18-dev
+
+      - name: Unit tests (ASan, UBSan)
+        run: make -C Tests test CXX=clang++-18
+
+      - name: Fuzz each target for 60 s
+        run: make -C Tests run-fuzz CXX=clang++-18 FUZZ_SECONDS=60
+
+      - name: Keep crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            Tests/crash-*
+            Tests/leak-*
+            Tests/timeout-*
+          if-no-files-found: ignore

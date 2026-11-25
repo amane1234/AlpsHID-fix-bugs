@@ -17,21 +17,13 @@ class AlpsFeatureBuffer : public IOBufferMemoryDescriptor {
     OSDeclareDefaultStructors(AlpsFeatureBuffer);
 public:
     void beginReply() { __atomic_store_n(&coverage, 0U, __ATOMIC_RELAXED); }
+    // Direct-mapped transports report length without using writeBytes() (see alps::covers).
     bool covers(unsigned length) const {
-        const auto bits = __atomic_load_n(&coverage, __ATOMIC_ACQUIRE);
-        const unsigned prefix = (1U << length) - 1;
-        // Direct-mapped transports report length without using writeBytes().
-        return getLength() >= length && (!bits || (bits & prefix) == prefix);
+        return alps::covers(__atomic_load_n(&coverage, __ATOMIC_ACQUIRE), getLength(), length);
     }
     IOByteCount writeBytes(IOByteCount offset, const void* bytes, IOByteCount length) override {
         auto written = IOBufferMemoryDescriptor::writeBytes(offset, bytes, length);
-        unsigned mask = 1U << 31; // distinguishes an empty write from direct mapping
-        if (offset < 15) {
-            const unsigned limit = 15 - static_cast<unsigned>(offset);
-            const unsigned count = written < limit ? static_cast<unsigned>(written) : limit;
-            mask |= ((1U << count) - 1) << offset;
-        }
-        __atomic_fetch_or(&coverage, mask, __ATOMIC_RELEASE);
+        __atomic_fetch_or(&coverage, alps::coverageMask(offset, written), __ATOMIC_RELEASE);
         return written;
     }
 private:
@@ -52,7 +44,7 @@ bool AlpsHIDEventDriver::t4_device_init() {
 
     setReady(false);
 
-    UInt8 tmp = '\0', sen_line_num_x, sen_line_num_y;
+    UInt8 tmp = '\0';
     alps_dev pri_data = {};
     IOReturn ret = kIOReturnSuccess;
 
@@ -63,24 +55,23 @@ bool AlpsHIDEventDriver::t4_device_init() {
         return false;
     }
     if (!geometry_valid) {
-        if (hid_interface->getProductID() == HID_PRODUCT_ID_T4_BTNLESS) {
+        const bool buttonless = hid_interface->getProductID() == HID_PRODUCT_ID_T4_BTNLESS;
+        if (buttonless) {
             ret = t4_read_write_register(T4_PRM_ID_CONFIG_3, &tmp, 0, true);
             if (ret!=kIOReturnSuccess) {
                 IOLog("failed T4_PRM_ID_CONFIG_3 (%d)\n", ret);
                 goto exit;
             }
-            sen_line_num_x = 16 + ((tmp & 0x0F) | (tmp & 0x08 ? 0xF0 : 0));
-            sen_line_num_y = 12 + (((tmp & 0xF0) >> 4) | (tmp & 0x80 ? 0xF0 : 0));
-        } else {
-            sen_line_num_x = 20;
-            sen_line_num_y = 12;
         }
 
-        pri_data.x_max = sen_line_num_x * T4_COUNT_PER_ELECTRODE;
-        pri_data.x_min = T4_COUNT_PER_ELECTRODE;
-        pri_data.y_max = sen_line_num_y * T4_COUNT_PER_ELECTRODE;
-        pri_data.y_min = T4_COUNT_PER_ELECTRODE;
-        pri_data.x_active_len_mm = pri_data.y_active_len_mm = 0;
+        alps::Geometry g;
+        alps::t4Geometry(buttonless, tmp, g);
+        pri_data.x_max = g.xMax;
+        pri_data.x_min = g.xMin;
+        pri_data.y_max = g.yMax;
+        pri_data.y_min = g.yMin;
+        pri_data.x_active_len_mm = g.xActiveLenMm;
+        pri_data.y_active_len_mm = g.yActiveLenMm;
         pri_data.btn_cnt = 1;
     }
 
@@ -151,16 +142,11 @@ void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryD
         u1_input_report pad;
         u1_sp_input_report stick;
     } frame = {};
-    const bool stick = dev_type == U1 && report_id == U1_SP_ABSOLUTE_REPORT_ID;
-    UInt32 size;
-    if (dev_type == T4 && report_id == T4_INPUT_REPORT_ID)
-        size = sizeof(frame.t4);
-    else if (dev_type == U1 && (report_id == U1_ABSOLUTE_REPORT_ID || report_id == U1_ABSOLUTE_REPORT_ID_SECD))
-        size = sizeof(frame.pad);
-    else if (stick)
-        size = offsetof(u1_sp_input_report, z);
-    else
+    unsigned size;
+    const auto kind = alps::classifyInput(dev_type == T4, report_id, size);
+    if (kind == alps::ReportKind::None)
         return;
+    const bool stick = kind == alps::ReportKind::U1Stick;
     if (copyReport(report, &frame, size) != size)
         return;
 
@@ -446,21 +432,6 @@ bool AlpsHIDEventDriver::initialiseDeviceWithRetry(UInt32 first_delay_ms) {
     return false;
 }
 
-// Register packets cover seven or eight bytes. At eight 0xff bytes the
-// second accumulator remains below 12000, so no intermediate fold is needed.
-UInt16 AlpsHIDEventDriver::t4_calc_check_sum(const UInt8* bytes, unsigned length) {
-    UInt16 a = 255, b = 255;
-    for (unsigned i = 0; i < length; ++i) {
-        a += bytes[i];
-        b += a;
-    }
-    a = (a & 255) + (a >> 8);
-    b = (b & 255) + (b >> 8);
-    a = (a & 255) + (a >> 8);
-    b = (b & 255) + (b >> 8);
-    return (b << 8) | a;
-}
-
 IOReturn AlpsHIDEventDriver::publishMultitouchInterface() {
     setProperty("IOFBTransform", 0ull, 32);
     setProperty("VoodooInputSupported", kOSBooleanTrue);
@@ -710,9 +681,9 @@ bool AlpsHIDEventDriver::suppressContacts(AbsoluteTime timestamp) const {
 }
 
 void AlpsHIDEventDriver::stickEventLocked(AbsoluteTime timestamp, const u1_sp_input_report& report) {
-    const SInt32 dx = static_cast<SInt16>(get_unaligned_le16(&report.x)) / 8;
-    const SInt32 dy = static_cast<SInt16>(get_unaligned_le16(&report.y)) / 8;
-    stick_buttons = report.buttons & 7;
+    SInt32 dx, dy;
+    alps::stickDelta(report, dx, dy);
+    stick_buttons = alps::stickButtons(report);
     if (!dx && !dy && (pad_buttons | stick_buttons) == sent_buttons)
         return;
     if (auto* event = reserveDeliveryLocked())
@@ -765,27 +736,15 @@ void AlpsHIDEventDriver::touchEventLocked(AbsoluteTime timestamp, bool click, De
 
 void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, const t4_input_report& report) {
     touchEventLocked(timestamp, report.button, [&](int i, UInt32& x, UInt32& y) {
-        const auto& slot = report.contact[i];
-        x = (slot.x_hi << 8) | slot.x_lo;
-        if (!slot.palm || slot.palm >= 0x80 || x == 0xffff)
-            return false;
-        y = (slot.y_hi << 8) | slot.y_lo;
-        y = y < t4_y_min ? t4_y_min : (y > t4_y_max ? t4_y_max : y);
-        y = t4_y_max + t4_y_min - y;
-        return true;
+        return alps::t4DecodeContact(report.contact[i], t4_y_min, t4_y_max, x, y);
     });
 }
 
 void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, const u1_input_report& report) {
     const bool clickpad = u1_button_count == 1;
-    pad_buttons = report.buttons & (clickpad ? 6 : 7);
-    touchEventLocked(timestamp, clickpad && (report.buttons & 1), [&](int i, UInt32& x, UInt32& y) {
-        const auto& slot = report.contact[i];
-        if (!(slot.z & 0x7f))
-            return false;
-        x = (slot.x_hi << 8) | slot.x_lo;
-        y = (slot.y_hi << 8) | slot.y_lo;
-        return true;
+    pad_buttons = alps::u1PadButtons(report.buttons, clickpad);
+    touchEventLocked(timestamp, alps::u1Click(report.buttons, clickpad), [&](int i, UInt32& x, UInt32& y) {
+        return alps::u1DecodeContact(report.contact[i], x, y);
     });
 }
 
@@ -848,11 +807,8 @@ bool AlpsHIDEventDriver::u1_device_init() {
             goto exit;
 
         // Reject invalid geometry before calculating coordinate ranges.
-        if (sen_line_num_x < 2 ||
-            sen_line_num_y < 2 ||
-            pitch_x == 0 ||
-            pitch_y == 0 ||
-            resolution == 0) {
+        alps::Geometry g;
+        if (!alps::u1Geometry(sen_line_num_x, sen_line_num_y, pitch_x, pitch_y, resolution, g)) {
             IOLog(
                 "%s::%s Invalid U1 geometry: "
                 "sensors=%u,%u pitch=%u,%u resolution=%u\n",
@@ -864,19 +820,12 @@ bool AlpsHIDEventDriver::u1_device_init() {
             goto exit;
         }
 
-        pri_data.x_active_len_mm =
-            pitch_x * (sen_line_num_x - 1);
-
-        pri_data.y_active_len_mm =
-            pitch_y * (sen_line_num_y - 1);
-
-        pri_data.x_max =
-            (resolution << 2) * (sen_line_num_x - 1);
-        pri_data.x_min = 1;
-
-        pri_data.y_max =
-            (resolution << 2) * (sen_line_num_y - 1);
-        pri_data.y_min = 1;
+        pri_data.x_active_len_mm = g.xActiveLenMm;
+        pri_data.y_active_len_mm = g.yActiveLenMm;
+        pri_data.x_max = g.xMax;
+        pri_data.x_min = g.xMin;
+        pri_data.y_max = g.yMax;
+        pri_data.y_min = g.yMin;
     }
 
     // Read button configuration.
@@ -885,10 +834,7 @@ bool AlpsHIDEventDriver::u1_device_init() {
     if (ret != kIOReturnSuccess)
         goto exit;
 
-    if ((tmp & 0x0F) == ((tmp & 0xF0) >> 4))
-        pri_data.btn_cnt = tmp & 0x0F;
-    else
-        pri_data.btn_cnt = 1;
+    pri_data.btn_cnt = alps::u1ButtonCount(tmp);
 
     // Detect optional trackpoint support.
     ret = u1_read_write_register(
@@ -986,7 +932,7 @@ IOReturn AlpsHIDEventDriver::exchangeFeature(UInt8 id, UInt8* bytes, size_t size
         return ret;
     // Some transports leave the descriptor length at capacity. Clearing the
     // request first also catches empty replies and avoids reusing stale data.
-    unsigned needed = id == T4_FEATURE_REPORT_ID ? 15 : U1_FEATURE_REPORT_LEN;
+    unsigned needed = alps::replyLength(id);
     if (needed > size || !feature_buffer->covers(needed) || data[0] != id)
         return kIOReturnIOError;
     memcpy(bytes, data, needed);
@@ -1002,26 +948,8 @@ IOReturn AlpsHIDEventDriver::u1_read_write_register(
     if (!hid_interface || (read_flag && !read_val))
         return kIOReturnBadArgument;
 
-    UInt8 check_sum = 0;
-    UInt8 input[U1_FEATURE_REPORT_LEN] = {};
-
-    input[0] = U1_FEATURE_REPORT_ID;
-
-    if (read_flag) {
-        input[1] = U1_CMD_REGISTER_READ;
-        input[6] = 0x00;
-    } else {
-        input[1] = U1_CMD_REGISTER_WRITE;
-        input[6] = write_val;
-    }
-
-    put_unaligned_le32(address, input + 2);
-
-    check_sum = U1_FEATURE_REPORT_LEN_ALL;
-    for (int i = 0; i < U1_FEATURE_REPORT_LEN - 1; ++i)
-        check_sum += input[i];
-
-    input[7] = check_sum;
+    UInt8 input[U1_FEATURE_REPORT_LEN];
+    alps::buildU1Request(address, read_flag, write_val, input);
 
     auto ret = exchangeFeature(U1_FEATURE_REPORT_ID, input, sizeof(input), read_flag);
     if (ret == kIOReturnSuccess && read_flag)
@@ -1038,65 +966,18 @@ IOReturn AlpsHIDEventDriver::t4_read_write_register(
     if (!hid_interface || (read_flag && !read_val))
         return kIOReturnBadArgument;
 
-    UInt16 check_sum = 0;
-    UInt8 input[T4_FEATURE_REPORT_LEN] = {};
-
-    input[0] = T4_FEATURE_REPORT_ID;
-    input[1] = read_flag
-        ? T4_CMD_REGISTER_READ
-        : T4_CMD_REGISTER_WRITE;
-
-    input[8] = read_flag ? 0x00 : write_val;
-
-    put_unaligned_le32(address, input + 2);
-    input[6] = 1;
-    input[7] = 0;
-
-    check_sum = t4_calc_check_sum(input + 1, 8);
-    input[9] = (UInt8)check_sum;
-    input[10] = (UInt8)(check_sum >> 8);
-    input[11] = 0;
+    UInt8 input[T4_FEATURE_REPORT_LEN];
+    alps::buildT4Request(address, read_flag, write_val, input);
 
     IOReturn ret = exchangeFeature(T4_FEATURE_REPORT_ID, input, sizeof(input), read_flag);
     if (ret != kIOReturnSuccess || !read_flag)
         return ret;
 
-    UInt32 responseAddress = (UInt32)input[6] | ((UInt32)input[7] << 8) |
-        ((UInt32)input[8] << 16) | ((UInt32)input[9] << 24);
-    if (responseAddress != address || get_unaligned_le16(input + 10) != 1 ||
-        get_unaligned_le16(input + 13) != t4_calc_check_sum(input + 6, 7)) {
+    if (!alps::parseT4Reply(input, address, *read_val)) {
         IOLog("%s: invalid T4 reply for register %x\n", getName(), address);
         return kIOReturnIOError;
     }
-    *read_val = input[12];
     return kIOReturnSuccess;
-}
-
-void AlpsHIDEventDriver::put_unaligned_le32(uint32_t val, void *p)
-{
-    put_le32(val, (uint8_t*)p);
-}
-
-void AlpsHIDEventDriver::put_le16(uint16_t val, uint8_t *p)
-{
-    *p++ = val;
-    *p++ = val >> 8;
-}
-
-void AlpsHIDEventDriver::put_le32(uint32_t val, uint8_t *p)
-{
-    put_le16(val >> 16, p + 2);
-    put_le16(val, p);
-}
-
-UInt16 AlpsHIDEventDriver::get_unaligned_le16(const void *p)
-{
-    return get_le16((const UInt8 *)p);
-}
-
-UInt16 AlpsHIDEventDriver::get_le16(const UInt8 *p)
-{
-    return p[0] | p[1] << 8;
 }
 
 bool AlpsHIDEventDriver::handleOpen(IOService *forClient, IOOptionBits options, void *arg) {

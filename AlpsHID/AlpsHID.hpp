@@ -31,6 +31,7 @@ for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/
 #include "../VoodooInput/VoodooInput/Trackpoint/TrackpointDevice.hpp"
 
 #include "helpers.hpp"
+#include "AlpsProtocol.hpp"
 
 #define HID_PRODUCT_ID_T3_BTNLESS 0xD0C0
 #define HID_PRODUCT_ID_COSMO 0x1202
@@ -52,60 +53,6 @@ for the alps t4 touchpad (https://github.com/torvalds/linux/blob/master/drivers/
 
 #define ALPS_VENDOR 0x44e
 #define CIRQUE_VENDOR 0x0488
-
-#define T4_INPUT_REPORT_LEN sizeof(struct t4_input_report)
-#define T4_FEATURE_REPORT_LEN T4_INPUT_REPORT_LEN
-#define T4_FEATURE_REPORT_ID 0x07
-#define T4_CMD_REGISTER_READ 0x08
-#define T4_CMD_REGISTER_WRITE 0x07
-#define T4_INPUT_REPORT_ID 0x09
-
-#define T4_ADDRESS_BASE 0xC2C0
-#define PRM_SYS_CONFIG_1 (T4_ADDRESS_BASE + 0x0002)
-#define T4_PRM_FEED_CONFIG_1 (T4_ADDRESS_BASE + 0x0004)
-#define T4_PRM_FEED_CONFIG_4 (T4_ADDRESS_BASE + 0x001A)
-#define T4_PRM_ID_CONFIG_3 (T4_ADDRESS_BASE + 0x00B0)
-#define T4_GPIO_PINS (T4_ADDRESS_BASE + 0x000C)
-
-#define T4_FEEDCFG4_ADVANCED_ABS_ENABLE 0x01
-#define T4_I2C_ABS 0x78
-#define T4_COUNT_PER_ELECTRODE 256
-
-/* Number of touches the driver reports to VoodooInput */
-#define MAX_TOUCHES 5
-
-/* Number of contact slots in the T4/U1 absolute reports as they come over the wire.
- * This is fixed by the hardware report layout (see the packed structs below) and is deliberately NOT
- * tied to MAX_TOUCHES. Code indexing contact[] must stay below it, e.g. with the max_fingers the device reports. */
-#define ALPS_REPORT_MAX_CONTACTS 5
-
-#define U1_MOUSE_REPORT_ID 0x01 /* Mouse data ReportID */
-#define U1_ABSOLUTE_REPORT_ID 0x03 /* Absolute data ReportID */
-#define U1_ABSOLUTE_REPORT_ID_SECD 0x02 /* FW-PTP Absolute data ReportID */
-#define U1_FEATURE_REPORT_ID 0x05 /* Feature ReportID */
-#define U1_SP_ABSOLUTE_REPORT_ID 0x06 /* SP (trackstick) absolute data ReportID */
-
-#define U1_FEATURE_REPORT_LEN 0x08 /* Feature Report Length */
-#define U1_FEATURE_REPORT_LEN_ALL 0x0A
-#define U1_CMD_REGISTER_READ 0xD1
-#define U1_CMD_REGISTER_WRITE 0xD2
-
-#define U1_DEVTYPE_SP_SUPPORT 0x10 /* SP Support */
-#define U1_DISABLE_DEV 0x01
-#define U1_TP_ABS_MODE 0x02
-#define U1_SP_ABS_MODE 0x80
-
-#define ADDRESS_U1_DEV_CTRL_1 0x00800040
-#define ADDRESS_U1_DEVICE_TYP 0x00800043
-#define ADDRESS_U1_NUM_SENS_X 0x00800047
-#define ADDRESS_U1_NUM_SENS_Y 0x00800048
-#define ADDRESS_U1_PITCH_SENS_X 0x00800049
-#define ADDRESS_U1_PITCH_SENS_Y 0x0080004A
-#define ADDRESS_U1_RESO_DWN_ABS 0x0080004E
-#define ADDRESS_U1_PAD_BTN 0x00800052
-#define ADDRESS_U1_SP_BTN 0x0080009F
-
-static_assert(MAX_TOUCHES <= ALPS_REPORT_MAX_CONTACTS, "MAX_TOUCHES cannot exceed the contact slots of the device reports");
 
 // Message types defined by ApplePS2Keyboard
 enum {
@@ -134,56 +81,6 @@ struct alps_dev {
     UInt32 sp_btn_cnt;
 };
 
-struct __attribute__((__packed__)) t4_contact_data {
-    UInt8 palm;
-    UInt8 x_lo;
-    UInt8 x_hi;
-    UInt8 y_lo;
-    UInt8 y_hi;
-};
-
-struct __attribute__((__packed__)) t4_input_report {
-    UInt8 reportID;
-    UInt8 numContacts;
-    struct t4_contact_data contact[ALPS_REPORT_MAX_CONTACTS];
-    UInt8 button;
-    UInt8 track[ALPS_REPORT_MAX_CONTACTS];
-    UInt8 zx[ALPS_REPORT_MAX_CONTACTS], zy[ALPS_REPORT_MAX_CONTACTS];
-    UInt8 palmTime[ALPS_REPORT_MAX_CONTACTS];
-    UInt8 kilroy;
-    UInt16 timeStamp;
-};
-
-struct __attribute__((__packed__)) u1_contact_data {
-    UInt8 x_lo;
-    UInt8 x_hi;
-    UInt8 y_lo;
-    UInt8 y_hi;
-    UInt8 z;
-};
-
-struct __attribute__((__packed__)) u1_input_report {
-    UInt8 reportID;
-    UInt8 buttons;
-    UInt8 numContacts;
-    struct u1_contact_data contact[ALPS_REPORT_MAX_CONTACTS];
-};
-
-struct __attribute__((__packed__)) u1_sp_input_report {
-    UInt8 reportID;
-    UInt8 buttons;
-    SInt16 x;
-    SInt16 y;
-    UInt16 z;
-};
-
-/* These structs are overlaid on raw device reports, so their size is part of the hardware protocol.
- * A changed packing/field type would silently shift every field after it; fail the build instead. */
-static_assert(sizeof(struct t4_contact_data) == 5, "t4_contact_data must be 5 bytes");
-static_assert(sizeof(struct t4_input_report) == 51, "t4_input_report must be 51 bytes");
-static_assert(sizeof(struct u1_contact_data) == 5, "u1_contact_data must be 5 bytes");
-static_assert(sizeof(struct u1_input_report) == 28, "u1_input_report must be 28 bytes");
-static_assert(sizeof(struct u1_sp_input_report) == 8, "u1_sp_input_report must be 8 bytes");
 
 class AlpsFeatureBuffer;
 
@@ -293,8 +190,6 @@ private:
     IOLock* input_lock = nullptr;
     bool releaseInputLocked(AbsoluteTime timestamp, bool releaseStick = true);
 
-    static UInt16 t4_calc_check_sum(const UInt8* bytes, unsigned length);
-
     /* Sends a report to the device to instruct it to enter Touchpad mode. They return whether the
      * device is now ready (and set `ready` accordingly). */
     bool t4_device_init();
@@ -306,13 +201,6 @@ private:
     /* initialiseDevice() with back-off: the touchpad needs time to answer after a power loss (S4).
      * first_delay_ms is the settle time before the first attempt. */
     bool initialiseDeviceWithRetry(UInt32 first_delay_ms);
-
-    /* Little-endian helpers from the Linux driver; none of them needs an instance */
-    static void put_unaligned_le32(uint32_t val, void *p);
-    static void put_le16(uint16_t val, uint8_t *p);
-    static void put_le32(uint32_t val, uint8_t *p);
-    static UInt16 get_unaligned_le16(const void *p);
-    static UInt16 get_le16(const UInt8 *p);
 
     IOReturn u1_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag);
     IOReturn t4_read_write_register(UInt32 address, UInt8 *read_val, UInt8 write_val, bool read_flag);
