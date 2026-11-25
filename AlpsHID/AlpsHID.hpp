@@ -185,6 +185,8 @@ static_assert(sizeof(struct u1_contact_data) == 5, "u1_contact_data must be 5 by
 static_assert(sizeof(struct u1_input_report) == 28, "u1_input_report must be 28 bytes");
 static_assert(sizeof(struct u1_sp_input_report) == 8, "u1_sp_input_report must be 8 bytes");
 
+class AlpsFeatureBuffer;
+
 class AlpsHIDEventDriver : public IOHIDEventService {
     OSDeclareDefaultStructors(AlpsHIDEventDriver);
 
@@ -209,8 +211,36 @@ protected:
     IOHIDInterface* hid_interface = nullptr;
 
 private:
-    void t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
-    void u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id);
+    void t4_raw_event(AbsoluteTime timestamp, const t4_input_report& report);
+    void u1_raw_event(AbsoluteTime timestamp, const u1_input_report& report);
+    void stickEventLocked(AbsoluteTime timestamp, const u1_sp_input_report& report);
+    template <typename Decode>
+    void touchEventLocked(AbsoluteTime timestamp, bool click, Decode decode);
+    bool suppressContacts(AbsoluteTime timestamp) const;
+
+    // A callback can re-enter this service. Queue snapshots under input_lock and
+    // let one caller deliver them in order after dropping the lock.
+    struct Delivery {
+        Delivery* next;
+        IOService* client;
+        bool touch;
+        bool pointer;
+        VoodooInputEvent contacts;
+        RelativePointerEvent relative;
+    };
+    Delivery first_delivery = {};
+    Delivery release_delivery = {}; // Releases can still be queued while a client callback is running.
+    Delivery* delivery_head = nullptr;
+    Delivery* delivery_tail = nullptr;
+    bool delivering = false;
+    Delivery* reserveDeliveryLocked(bool release = false);
+    void unlockAndDeliver();
+    void setPointerLocked(Delivery* event, AbsoluteTime timestamp, SInt32 dx, SInt32 dy);
+    UInt8 sent_buttons = 0;
+    int previous_thumb = -1;
+    IONotifier* lid_notifier = nullptr;
+    unsigned lid_state = 2; // unknown until registration and initial snapshot
+    static IOReturn lidChanged(void* target, void*, UInt32 type, IOService*, void* argument, vm_size_t);
 
     // Explicit initial values (IOKit zero-fills new objects, this just makes the intended state visible).
     bool ready = false;
@@ -219,7 +249,7 @@ private:
 
     // Touchpad switched off with the keyboard's touchpad key (kKeyboardSetTouchStatus from VoodooPS2Keyboard).
     // The trackpoint keeps working.
-    volatile bool touchpad_disabled = false;
+    bool touchpad_disabled = false;
     // Input was already released for the closed lid / the disabled touchpad, so that it is not sent again
     // with every report. Both are protected by input_lock.
     bool lid_released = false;
@@ -229,7 +259,7 @@ private:
     void setReady(bool value) { __atomic_store_n(&ready, value, __ATOMIC_RELEASE); }
     dev_num dev_type = U1;
 
-    // T4 sensor-dependent coordinate range, refreshed after every device reset.
+    // Geometry belongs to this HID interface and is re-probed after failed setup.
     UInt32 t4_y_max = 0;
     UInt32 t4_y_min = T4_COUNT_PER_ELECTRODE;
 
@@ -246,7 +276,9 @@ private:
     void scheduleWakeAttempt();
 
     VoodooInputEvent inputMessage = {};
-    RelativePointerEvent spInputMessage = {};
+    bool geometry_valid = false;
+    AlpsFeatureBuffer* feature_buffer = nullptr;
+    IOReturn exchangeFeature(UInt8 id, UInt8* bytes, size_t size, bool read);
     UInt32 u1_button_count = 0;
     bool has_stick = false;
     UInt8 pad_buttons = 0;
@@ -255,12 +287,12 @@ private:
 
     IOService* voodooInputInstance = nullptr;
 
-    // Serializes input state (inputMessage, spInputMessage, button caches) and voodooInputInstance
+    // Serializes input state, the delivery queue, button caches and voodooInputInstance
     // between the HID interrupt path, the recovery work loop and VoodooInput open/close.
     IOLock* input_lock = nullptr;
-    void releaseInputLocked(AbsoluteTime timestamp);
+    bool releaseInputLocked(AbsoluteTime timestamp, bool releaseStick = true);
 
-    UInt16 t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length);
+    static UInt16 t4_calc_check_sum(const UInt8* bytes, unsigned length);
 
     /* Sends a report to the device to instruct it to enter Touchpad mode. They return whether the
      * device is now ready (and set `ready` accordingly). */

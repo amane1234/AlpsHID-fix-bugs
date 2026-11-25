@@ -5,10 +5,39 @@
 
 #include "AlpsHID.hpp"
 #include <IOKit/pwr_mgt/RootDomain.h>
+#include <kern/task.h>
 
 
 #define super IOHIDEventService
 OSDefineMetaClassAndStructors(AlpsHIDEventDriver, IOHIDEventService);
+
+// I2C transports may call writeBytes() with the actual reply but leave the
+// descriptor length at capacity. Track the protocol prefix independently.
+class AlpsFeatureBuffer : public IOBufferMemoryDescriptor {
+    OSDeclareDefaultStructors(AlpsFeatureBuffer);
+public:
+    void beginReply() { __atomic_store_n(&coverage, 0U, __ATOMIC_RELAXED); }
+    bool covers(unsigned length) const {
+        const auto bits = __atomic_load_n(&coverage, __ATOMIC_ACQUIRE);
+        const unsigned prefix = (1U << length) - 1;
+        // Direct-mapped transports report length without using writeBytes().
+        return getLength() >= length && (!bits || (bits & prefix) == prefix);
+    }
+    IOByteCount writeBytes(IOByteCount offset, const void* bytes, IOByteCount length) override {
+        auto written = IOBufferMemoryDescriptor::writeBytes(offset, bytes, length);
+        unsigned mask = 1U << 31; // distinguishes an empty write from direct mapping
+        if (offset < 15) {
+            const unsigned limit = 15 - static_cast<unsigned>(offset);
+            const unsigned count = written < limit ? static_cast<unsigned>(written) : limit;
+            mask |= ((1U << count) - 1) << offset;
+        }
+        __atomic_fetch_or(&coverage, mask, __ATOMIC_RELEASE);
+        return written;
+    }
+private:
+    unsigned coverage = 0;
+};
+OSDefineMetaClassAndStructors(AlpsFeatureBuffer, IOBufferMemoryDescriptor);
 
 // Copies at most max_len bytes of a report into buffer, never more than the buffer can hold
 // (the report length is device-controlled), and returns the number of bytes copied.
@@ -33,25 +62,27 @@ bool AlpsHIDEventDriver::t4_device_init() {
         IOLog("%s::%s HID interface not found\n", getName(), name ? name : "unknown");
         return false;
     }
-    if (hid_interface->getProductID() == HID_PRODUCT_ID_T4_BTNLESS) {
-        ret = t4_read_write_register(T4_PRM_ID_CONFIG_3, &tmp, 0, true);
-        if (ret!=kIOReturnSuccess) {
-            IOLog("failed T4_PRM_ID_CONFIG_3 (%d)\n", ret);
-            goto exit;
+    if (!geometry_valid) {
+        if (hid_interface->getProductID() == HID_PRODUCT_ID_T4_BTNLESS) {
+            ret = t4_read_write_register(T4_PRM_ID_CONFIG_3, &tmp, 0, true);
+            if (ret!=kIOReturnSuccess) {
+                IOLog("failed T4_PRM_ID_CONFIG_3 (%d)\n", ret);
+                goto exit;
+            }
+            sen_line_num_x = 16 + ((tmp & 0x0F) | (tmp & 0x08 ? 0xF0 : 0));
+            sen_line_num_y = 12 + (((tmp & 0xF0) >> 4) | (tmp & 0x80 ? 0xF0 : 0));
+        } else {
+            sen_line_num_x = 20;
+            sen_line_num_y = 12;
         }
-        sen_line_num_x = 16 + ((tmp & 0x0F) | (tmp & 0x08 ? 0xF0 : 0));
-        sen_line_num_y = 12 + (((tmp & 0xF0) >> 4) | (tmp & 0x80 ? 0xF0 : 0));
-    } else {
-        sen_line_num_x = 20;
-        sen_line_num_y = 12;
-    }
 
-    pri_data.x_max = sen_line_num_x * T4_COUNT_PER_ELECTRODE;
-    pri_data.x_min = T4_COUNT_PER_ELECTRODE;
-    pri_data.y_max = sen_line_num_y * T4_COUNT_PER_ELECTRODE;
-    pri_data.y_min = T4_COUNT_PER_ELECTRODE;
-    pri_data.x_active_len_mm = pri_data.y_active_len_mm = 0;
-    pri_data.btn_cnt = 1;
+        pri_data.x_max = sen_line_num_x * T4_COUNT_PER_ELECTRODE;
+        pri_data.x_min = T4_COUNT_PER_ELECTRODE;
+        pri_data.y_max = sen_line_num_y * T4_COUNT_PER_ELECTRODE;
+        pri_data.y_min = T4_COUNT_PER_ELECTRODE;
+        pri_data.x_active_len_mm = pri_data.y_active_len_mm = 0;
+        pri_data.btn_cnt = 1;
+    }
 
     // Preserve unrelated configuration bits on every T4 variant, not only BTNLESS.
     ret = t4_read_write_register(PRM_SYS_CONFIG_1, &tmp, 0, true);
@@ -80,73 +111,94 @@ bool AlpsHIDEventDriver::t4_device_init() {
     }
     pri_data.max_fingers = 5;
 
-    // The Y range differs between T4 variants; use the probed geometry for inversion.
-    t4_y_max = pri_data.y_max;
-    t4_y_min = pri_data.y_min;
+    if (!geometry_valid) {
+        // The Y range differs between T4 variants; use the probed geometry for inversion.
+        t4_y_max = pri_data.y_max;
+        t4_y_min = pri_data.y_min;
 
-    setProperty(VOODOO_INPUT_LOGICAL_MAX_X_KEY, pri_data.x_max, 32);
-    setProperty(VOODOO_INPUT_LOGICAL_MAX_Y_KEY, pri_data.y_max, 32);
+        setProperty(VOODOO_INPUT_LOGICAL_MAX_X_KEY, pri_data.x_max, 32);
+        setProperty(VOODOO_INPUT_LOGICAL_MAX_Y_KEY, pri_data.y_max, 32);
 
-    setProperty(VOODOO_INPUT_PHYSICAL_MAX_X_KEY, 10240, 32);
-    setProperty(VOODOO_INPUT_PHYSICAL_MAX_Y_KEY, 6140, 32);
+        setProperty(VOODOO_INPUT_PHYSICAL_MAX_X_KEY, 10240, 32);
+        setProperty(VOODOO_INPUT_PHYSICAL_MAX_Y_KEY, 6140, 32);
+    }
 
+    geometry_valid = true;
     setReady(true);
     return true;
 
 exit:
+    geometry_valid = false;
     setReady(false);
     return false;
 }
 
-void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
+IOReturn AlpsHIDEventDriver::lidChanged(void* target, void*, UInt32 type, IOService*, void* argument, vm_size_t) {
+    if (type == kIOPMMessageClamshellStateChange) {
+        auto* driver = static_cast<AlpsHIDEventDriver*>(target);
+        unsigned closed = (reinterpret_cast<uintptr_t>(argument) & kClamshellStateBit) != 0;
+        __atomic_store_n(&driver->lid_state, closed, __ATOMIC_RELEASE);
+    }
+    return kIOReturnSuccess;
+}
 
-    // Suppress Alps input reports while the lid is closed.
-    bool lidClosed = false;
-    IOPMrootDomain *root = getPMRootDomain();
-    if (root)
-        lidClosed = OSDynamicCast(OSBoolean, root->getProperty("AppleClamshellState")) == kOSBooleanTrue;
-
-    if (!input_lock)
+void AlpsHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor* report, IOHIDReportType report_type, UInt32 report_id) {
+    if (!isReady() || !input_lock || !report || report_type != kIOHIDReportTypeInput)
         return;
 
-    // Reports arrive on the HID transport's thread, while releaseInput() runs on the recovery loop
-    // and VoodooInput can open/close at any time: all of them touch the same input state.
+    union {
+        t4_input_report t4;
+        u1_input_report pad;
+        u1_sp_input_report stick;
+    } frame = {};
+    const bool stick = dev_type == U1 && report_id == U1_SP_ABSOLUTE_REPORT_ID;
+    UInt32 size;
+    if (dev_type == T4 && report_id == T4_INPUT_REPORT_ID)
+        size = sizeof(frame.t4);
+    else if (dev_type == U1 && (report_id == U1_ABSOLUTE_REPORT_ID || report_id == U1_ABSOLUTE_REPORT_ID_SECD))
+        size = sizeof(frame.pad);
+    else if (stick)
+        size = offsetof(u1_sp_input_report, z);
+    else
+        return;
+    if (copyReport(report, &frame, size) != size)
+        return;
+
+    unsigned closed = __atomic_load_n(&lid_state, __ATOMIC_ACQUIRE);
+    if (closed == 2) {
+        auto* root = getPMRootDomain();
+        closed = root && root->getProperty("AppleClamshellState") == kOSBooleanTrue;
+    }
+
     IOLockLock(input_lock);
-    if (lidClosed) {
-        // Lift fingers and buttons once; every later report while the lid stays closed is just dropped
-        // (it used to send a full release to VoodooInput for each of them)
-        if (!lid_released) {
-            releaseInputLocked(timestamp);
-            lid_released = true;
+    if (isReady() && voodooInputInstance) {
+        if (closed) {
+            if (!lid_released)
+                lid_released = releaseInputLocked(timestamp);
+        } else {
+            lid_released = false;
+            if (stick) {
+                if (has_stick)
+                    stickEventLocked(timestamp, frame.stick);
+            } else if (!dropTouchpadReportLocked(timestamp)) {
+                if (dev_type == T4)
+                    t4_raw_event(timestamp, frame.t4);
+                else
+                    u1_raw_event(timestamp, frame.pad);
+            }
         }
-        IOLockUnlock(input_lock);
-        return;
     }
-    lid_released = false;
-
-    switch (dev_type) {
-        case T4:
-            t4_raw_event(timestamp, report, report_type, report_id);
-            break;
-        case U1:
-            u1_raw_event(timestamp, report, report_type, report_id);
-            break;
-    }
-    IOLockUnlock(input_lock);
+    unlockAndDeliver();
 }
 
 bool AlpsHIDEventDriver::start(IOService* provider) {
+    uint64_t quiet_ns = 500000000;
+    OSNumber* quiet = OSDynamicCast(OSNumber, getProperty("QuietTimeAfterTyping"));
+    if (quiet)
+        quiet_ns = quiet->unsigned64BitValue() * 1000000;
+    nanoseconds_to_absolutetime(quiet_ns, &max_after_typing);
     if (!super::start(provider))
         return false;
-
-    max_after_typing = 500000000;
-    key_time = 0;
-
-    // Read QuietTimeAfterTyping configuration value (if available)
-    OSNumber* quietTimeAfterTyping = OSDynamicCast(OSNumber, getProperty("QuietTimeAfterTyping"));
-
-    if (quietTimeAfterTyping != NULL)
-        max_after_typing = quietTimeAfterTyping->unsigned64BitValue() * 1000000;
 
     setProperty("VoodooI2CServices Supported", kOSBooleanTrue);
 
@@ -194,6 +246,23 @@ bool AlpsHIDEventDriver::handleStart(IOService* provider) {
     if (!input_lock)
         return false;
 
+    for (int i = 0; i < MAX_TOUCHES; ++i) {
+        auto& contact = inputMessage.transducers[i];
+        contact.type = VoodooInputTransducerType::FINGER;
+        contact.secondaryId = i;
+        contact.fingerType = static_cast<MT2FingerType>(kMT2FingerTypeIndexFinger + i % 4);
+    }
+    inputMessage.contact_count = MAX_TOUCHES;
+    auto* root = getPMRootDomain();
+    if (root) {
+        lid_notifier = root->registerInterest(gIOGeneralInterest, lidChanged, this);
+        if (lid_notifier) {
+            unsigned unknown = 2;
+            unsigned closed = root->getProperty("AppleClamshellState") == kOSBooleanTrue;
+            // A notification during registration takes precedence over this snapshot.
+            __atomic_compare_exchange_n(&lid_state, &unknown, closed, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+        }
+    }
     recovery_loop = IOWorkLoop::workLoop();
     if (!recovery_loop)
         return false;
@@ -377,33 +446,19 @@ bool AlpsHIDEventDriver::initialiseDeviceWithRetry(UInt32 first_delay_ms) {
     return false;
 }
 
-UInt16 AlpsHIDEventDriver::t4_calc_check_sum(UInt8 *buffer, unsigned long offset, unsigned long length)
-{
-    UInt16 sum1 = 0xFF, sum2 = 0xFF;
-    unsigned long i = 0;
-
-    if (offset + length >= 50)
-        return 0;
-
-    while (length > 0) {
-        unsigned long tlen = length > 20 ? 20 : length;
-
-        length -= tlen;
-
-        do {
-            sum1 += buffer[offset + i];
-            sum2 += sum1;
-            i++;
-        } while (--tlen > 0);
-
-        sum1 = (sum1 & 0xFF) + (sum1 >> 8);
-        sum2 = (sum2 & 0xFF) + (sum2 >> 8);
+// Register packets cover seven or eight bytes. At eight 0xff bytes the
+// second accumulator remains below 12000, so no intermediate fold is needed.
+UInt16 AlpsHIDEventDriver::t4_calc_check_sum(const UInt8* bytes, unsigned length) {
+    UInt16 a = 255, b = 255;
+    for (unsigned i = 0; i < length; ++i) {
+        a += bytes[i];
+        b += a;
     }
-
-    sum1 = (sum1 & 0xFF) + (sum1 >> 8);
-    sum2 = (sum2 & 0xFF) + (sum2 >> 8);
-
-    return(sum2 << 8 | sum1);
+    a = (a & 255) + (a >> 8);
+    b = (b & 255) + (b >> 8);
+    a = (a & 255) + (a >> 8);
+    b = (b & 255) + (b >> 8);
+    return (b << 8) | a;
 }
 
 IOReturn AlpsHIDEventDriver::publishMultitouchInterface() {
@@ -414,12 +469,19 @@ IOReturn AlpsHIDEventDriver::publishMultitouchInterface() {
 }
 
 void AlpsHIDEventDriver::handleStop(IOService* provider) {
+    if (lid_notifier) {
+        lid_notifier->remove();
+        lid_notifier = nullptr;
+    }
     updateRecovery(RecoveryAction::Stop);
 
+    IOService* previous = nullptr;
     if (input_lock) {
         IOLockLock(input_lock);
-        OSSafeReleaseNULL(voodooInputInstance);
+        previous = voodooInputInstance;
+        voodooInputInstance = nullptr;
         IOLockUnlock(input_lock);
+        OSSafeReleaseNULL(previous);
     } else {
         OSSafeReleaseNULL(voodooInputInstance);
     }
@@ -437,7 +499,7 @@ IOReturn AlpsHIDEventDriver::message(UInt32 type, IOService* provider, void* arg
         {
             if (!argument)
                 return kIOReturnBadArgument;
-            *static_cast<bool*>(argument) = !touchpad_disabled;
+            *static_cast<bool*>(argument) = !__atomic_load_n(&touchpad_disabled, __ATOMIC_RELAXED);
             return kIOReturnSuccess;
         }
 
@@ -449,19 +511,18 @@ IOReturn AlpsHIDEventDriver::message(UInt32 type, IOService* provider, void* arg
             IOLog("%s::%s Touchpad %s by keyboard\n", getName(), name ? name : "unknown", enable ? "enabled" : "disabled");
             if (input_lock) {
                 IOLockLock(input_lock);
-                touchpad_disabled = !enable;
+                __atomic_store_n(&touchpad_disabled, !enable, __ATOMIC_RELAXED);
                 // Lift the fingers right away instead of waiting for the next report
                 if (!enable && !touchpad_released) {
                     AbsoluteTime timestamp;
                     clock_get_uptime(&timestamp);
-                    releaseInputLocked(timestamp);
-                    touchpad_released = true;
+                    touchpad_released = releaseInputLocked(timestamp, false);
                 }
                 if (enable)
                     touchpad_released = false;
-                IOLockUnlock(input_lock);
+                unlockAndDeliver();
             } else {
-                touchpad_disabled = !enable;
+                __atomic_store_n(&touchpad_disabled, !enable, __ATOMIC_RELAXED);
             }
             return kIOReturnSuccess;
         }
@@ -472,10 +533,9 @@ IOReturn AlpsHIDEventDriver::message(UInt32 type, IOService* provider, void* arg
                 return kIOReturnBadArgument;
 
             //  Remember last time key was pressed
-            key_time = *((uint64_t*)argument);
-#if DEBUG
-            IOLog("%s::keyPressed = %llu\n", getName(), key_time);
-#endif
+            uint64_t time;
+            nanoseconds_to_absolutetime(*static_cast<const uint64_t*>(argument), &time);
+            __atomic_store_n(&key_time, time, __ATOMIC_RELEASE);
             return kIOReturnSuccess;
         }
     }
@@ -485,6 +545,11 @@ IOReturn AlpsHIDEventDriver::message(UInt32 type, IOService* provider, void* arg
 }
 
 void AlpsHIDEventDriver::free() {
+    if (lid_notifier) {
+        lid_notifier->remove();
+        lid_notifier = nullptr;
+    }
+    OSSafeReleaseNULL(feature_buffer);
     // Keep the loop alive through the final PM/termination callbacks and partial starts.
     if (wake_timer && wake_timer->getWorkLoop())
         recovery_loop->removeEventSource(wake_timer);
@@ -507,289 +572,207 @@ bool AlpsHIDEventDriver::didTerminate(IOService* provider, IOOptionBits options,
 // Called with input_lock held for every touchpad report: drops it while the touchpad is switched off,
 // releasing the contacts once.
 bool AlpsHIDEventDriver::dropTouchpadReportLocked(AbsoluteTime timestamp) {
-    if (!touchpad_disabled) {
+    if (!__atomic_load_n(&touchpad_disabled, __ATOMIC_RELAXED)) {
         touchpad_released = false;
         return false;
     }
     if (!touchpad_released) {
-        releaseInputLocked(timestamp);
-        touchpad_released = true;
+        touchpad_released = releaseInputLocked(timestamp, false);
     }
     return true;
 }
 
 // Release both endpoints before input is disabled. Clear cached source state
 // even if the VoodooInput client has already disconnected.
+AlpsHIDEventDriver::Delivery* AlpsHIDEventDriver::reserveDeliveryLocked(bool release) {
+    if (!voodooInputInstance)
+        return nullptr;
+    Delivery* event = &first_delivery;
+    if (event->client) {
+        if (release && !release_delivery.client)
+            event = &release_delivery;
+        else
+            event = static_cast<Delivery*>(IOMalloc(sizeof(Delivery)));
+    }
+    if (!event)
+        return nullptr;
+    event->client = voodooInputInstance;
+    event->client->retain();
+    event->next = nullptr;
+    event->touch = event->pointer = false;
+    if (delivery_tail)
+        delivery_tail->next = event;
+    else
+        delivery_head = event;
+    delivery_tail = event;
+    return event;
+}
+
+// Called with input_lock held. Reentrant reports append behind the current
+// delivery, including releases, without recursing into the client.
+void AlpsHIDEventDriver::unlockAndDeliver() {
+    if (delivering || !delivery_head) {
+        IOLockUnlock(input_lock);
+        return;
+    }
+    delivering = true;
+    while (delivery_head) {
+        auto* event = delivery_head;
+        delivery_head = event->next;
+        if (!delivery_head)
+            delivery_tail = nullptr;
+        IOService* client = event->client;
+        bool current = client == voodooInputInstance;
+        IOLockUnlock(input_lock);
+        if (current && event->touch)
+            super::messageClient(kIOMessageVoodooInputMessage, client, &event->contacts, sizeof(event->contacts));
+        if (current && event->touch && event->pointer) {
+            IOLockLock(input_lock);
+            current = client == voodooInputInstance;
+            IOLockUnlock(input_lock);
+        }
+        if (current && event->pointer)
+            super::messageClient(kIOMessageVoodooTrackpointRelativePointer, client, &event->relative, sizeof(event->relative));
+        client->release();
+        bool embedded = event == &first_delivery || event == &release_delivery;
+        if (!embedded)
+            IOFree(event, sizeof(Delivery));
+        IOLockLock(input_lock);
+        if (embedded)
+            event->client = nullptr;
+    }
+    delivering = false;
+    IOLockUnlock(input_lock);
+}
+
+void AlpsHIDEventDriver::setPointerLocked(Delivery* event, AbsoluteTime timestamp, SInt32 dx, SInt32 dy) {
+    const UInt8 buttons = pad_buttons | stick_buttons;
+    if (!dx && !dy && buttons == sent_buttons)
+        return;
+    sent_buttons = buttons;
+    event->pointer = true;
+    event->relative = {};
+    event->relative.dx = dx;
+    event->relative.dy = dy;
+    event->relative.buttons = buttons;
+    event->relative.timestamp = timestamp;
+}
+
 void AlpsHIDEventDriver::releaseInput(AbsoluteTime timestamp) {
     if (!input_lock)
         return;
     IOLockLock(input_lock);
     releaseInputLocked(timestamp);
-    IOLockUnlock(input_lock);
+    unlockAndDeliver();
 }
 
-void AlpsHIDEventDriver::releaseInputLocked(AbsoluteTime timestamp) {
-    pad_buttons = stick_buttons = 0;
+bool AlpsHIDEventDriver::releaseInputLocked(AbsoluteTime timestamp, bool releaseStick) {
+    auto* event = reserveDeliveryLocked(true);
+    if (voodooInputInstance && !event)
+        return false;
+    pad_buttons = 0;
+    if (releaseStick)
+        stick_buttons = 0;
     for (int i = 0; i < MAX_TOUCHES; ++i) {
-        VoodooInputTransducer& contact = inputMessage.transducers[i];
+        auto& contact = inputMessage.transducers[i];
         contact.isValid = contact.isTransducerActive ||
             (contact.isValid && contact.isPhysicalButtonDown);
         contact.isTransducerActive = false;
         contact.isPhysicalButtonDown = false;
-        contact.type = VoodooInputTransducerType::FINGER;
-        contact.secondaryId = i;
         contact.timestamp = timestamp;
     }
-    inputMessage.contact_count = MAX_TOUCHES;
     inputMessage.timestamp = timestamp;
-    spInputMessage = {};
-    spInputMessage.timestamp = timestamp;
-    if (voodooInputInstance) {
-        super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance,
-                             &inputMessage, sizeof(inputMessage));
-        super::messageClient(kIOMessageVoodooTrackpointRelativePointer, voodooInputInstance,
-                             &spInputMessage, sizeof(spInputMessage));
+    if (event) {
+        event->touch = true;
+        event->contacts = inputMessage;
+        setPointerLocked(event, timestamp, 0, 0);
     }
+    return true;
 }
 
-void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
-
-    uint64_t now_abs;
-    clock_get_uptime(&now_abs);
-    uint64_t now_ns;
-    absolutetime_to_nanoseconds(now_abs, &now_ns);
-
-    // Suppress contacts, not the frame: releases and physical buttons must
-    // still reach VoodooInput. Stick reports are independent of typing.
-    const bool suppressContacts = key_time && now_ns >= key_time &&
-        now_ns - key_time < max_after_typing;
-
-    if (!isReady() || !report || !voodooInputInstance)
-        return;
-
-    if (report_type != kIOHIDReportTypeInput)
-        return;
-
-    if (report_id != T4_INPUT_REPORT_ID)
-        return;
-
-    if (dropTouchpadReportLocked(timestamp))
-        return;
-
-    // A report shorter than expected would leave the rest of reportData as uninitialised stack garbage
-    t4_input_report reportData = {};
-
-    if (copyReport(report, &reportData, T4_INPUT_REPORT_LEN) != T4_INPUT_REPORT_LEN)
-        return;
-
-    // Reject palm contacts per slot. Dropping an entire report would keep
-    // previous contacts active and prevent other fingers from updating.
-    unsigned int x, y;
-
-    int contactCount = 0;
-    for (int i = 0; i < MAX_TOUCHES; i++) {
-        VoodooInputTransducer* transducer = &inputMessage.transducers[i];
-
-        transducer->fingerType = (MT2FingerType) (kMT2FingerTypeIndexFinger + (i % 4));
-        transducer->type = VoodooInputTransducerType::FINGER;
-        transducer->secondaryId = i;
-
-        x = reportData.contact[i].x_hi << 8 | reportData.contact[i].x_lo;
-        y = reportData.contact[i].y_hi << 8 | reportData.contact[i].y_lo;
-        // 0xffff denotes an empty contact in the ALPS T4 report format.
-        bool contactValid = (reportData.contact[i].palm < 0x80 &&
-                             reportData.contact[i].palm > 0 &&
-                             x != 0xffff && !suppressContacts);
-        // Include lifts: VoodooInput skips isValid=false. Keep a previously
-        // reported clicking slot until button release, but never add unused
-        // slots just because a physical button is held.
-        transducer->isValid = contactValid || transducer->isTransducerActive ||
-            (transducer->isValid && transducer->isPhysicalButtonDown);
-        transducer->timestamp = timestamp;
-        transducer->supportsPressure = false;
-
-        if (contactValid) {
-            // Invert within the detected hardware range; clamp malformed samples.
-            if (y < t4_y_min)
-                y = t4_y_min;
-            else if (y > t4_y_max)
-                y = t4_y_max;
-            y = t4_y_max + t4_y_min - y;
-
-            transducer->isTransducerActive = true;
-            transducer->secondaryId = i;
-
-            transducer->previousCoordinates = transducer->currentCoordinates;
-            transducer->currentCoordinates.x = x;
-            transducer->currentCoordinates.y = y;
-
-            transducer->isPhysicalButtonDown = reportData.button;
-
-            contactCount += 1;
-        } else {
-            transducer->isTransducerActive =  false;
-            transducer->secondaryId = i;
-            transducer->previousCoordinates = transducer->currentCoordinates;
-            transducer->isPhysicalButtonDown = reportData.button;
-        }
-    }
-
-    inputMessage.contact_count = MAX_TOUCHES;
-    inputMessage.timestamp = timestamp;
-
-    if (contactCount >= 4 || reportData.button) {
-        // simple thumb detection: to find the lowest finger touch in the vertical direction.
-        // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
-        UInt32 y_max = 0;
-        int thumb_index = -1;
-        for (int i = 0; i < MAX_TOUCHES; i++) {
-            VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
-            if (inputTransducer->isTransducerActive && inputTransducer->currentCoordinates.y >= y_max) {
-                y_max = inputTransducer->currentCoordinates.y;
-                thumb_index = i;
-            }
-        }
-        // Button-only reports have no valid thumb candidate.
-        if (thumb_index >= 0)
-            inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
-    }
-
-    super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance, &inputMessage, sizeof(VoodooInputEvent));
+bool AlpsHIDEventDriver::suppressContacts(AbsoluteTime timestamp) const {
+    const auto key = __atomic_load_n(&key_time, __ATOMIC_ACQUIRE);
+    return key && timestamp >= key && timestamp - key < max_after_typing;
 }
 
-void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, IOMemoryDescriptor *report, IOHIDReportType report_type, UInt32 report_id) {
-
-    uint64_t now_abs;
-    clock_get_uptime(&now_abs);
-    uint64_t now_ns;
-    absolutetime_to_nanoseconds(now_abs, &now_ns);
-#if DEBUG
-    IOLog("%s::%s Recieving report: %u\n",getName(),name,report_id);
-#endif
-
-    // Suppress contacts, not the frame: releases and physical buttons must
-    // still reach VoodooInput. Stick reports are independent of typing.
-    const bool suppressContacts = key_time && now_ns >= key_time &&
-        now_ns - key_time < max_after_typing;
-
-    if (!isReady() || !report || !voodooInputInstance)
+void AlpsHIDEventDriver::stickEventLocked(AbsoluteTime timestamp, const u1_sp_input_report& report) {
+    const SInt32 dx = static_cast<SInt16>(get_unaligned_le16(&report.x)) / 8;
+    const SInt32 dy = static_cast<SInt16>(get_unaligned_le16(&report.y)) / 8;
+    stick_buttons = report.buttons & 7;
+    if (!dx && !dy && (pad_buttons | stick_buttons) == sent_buttons)
         return;
+    if (auto* event = reserveDeliveryLocked())
+        setPointerLocked(event, timestamp, dx, dy);
+}
 
-    if (report_type != kIOHIDReportTypeInput)
+// The caller supplies device-specific decoding. Slot history stays at the
+// hardware index, including sparse slots and the first inactive lift frame.
+template <typename Decode>
+void AlpsHIDEventDriver::touchEventLocked(AbsoluteTime timestamp, bool click, Decode decode) {
+    auto* event = reserveDeliveryLocked();
+    if (!event)
         return;
-
-    unsigned int x, y, z;
-
-    if(report_id==U1_ABSOLUTE_REPORT_ID || report_id==U1_ABSOLUTE_REPORT_ID_SECD) {
-        // Only the touchpad is switched off; trackpoint reports below are still handled
-        if (dropTouchpadReportLocked(timestamp))
-            return;
-
-        // All five fixed slots must be present. Zero-padding a truncated report would
-        // fabricate coordinates, button releases, and lifts for the missing contacts.
-        u1_input_report reportData = {};
-        if (copyReport(report, &reportData, sizeof(reportData)) != sizeof(reportData))
-            return;
-#if DEBUG
-        IOLog("%s::%s Getting touched\n",getName(),name);
-#endif
-        const bool clickpadDown = u1_button_count == 1 && (reportData.buttons & 0x01);
-        int contactCount = 0;
-        for (int i = 0; i < MAX_TOUCHES; i++) {
-            VoodooInputTransducer* transducer = &inputMessage.transducers[i];
-
-            transducer->type = VoodooInputTransducerType::FINGER;
-            transducer->fingerType = (MT2FingerType) (kMT2FingerTypeIndexFinger + (i % 4));
-            transducer->secondaryId = i;
-
-            x = reportData.contact[i].x_hi << 8 | reportData.contact[i].x_lo;
-            y = reportData.contact[i].y_hi << 8 | reportData.contact[i].y_lo;
-            z = reportData.contact[i].z & 0x7F;
-            bool contactValid = z != 0 && !suppressContacts;
-            // Include lifts, without creating unused contacts on a click.
-            transducer->isValid = contactValid || transducer->isTransducerActive ||
-                (transducer->isValid && transducer->isPhysicalButtonDown);
-            transducer->timestamp = timestamp;
-            transducer->supportsPressure = false;
-
-            if (contactValid) {
-                transducer->isTransducerActive = true;
-                transducer->secondaryId = i;
-#if DEBUG
-                IOLog("%s::%s Finger %i at(%u,%u)\n", getName(), name, i, x, y);
-#endif
-                transducer->previousCoordinates = transducer->currentCoordinates;
-                transducer->currentCoordinates.x = x;
-                transducer->currentCoordinates.y = y;
-                transducer->isPhysicalButtonDown = clickpadDown;
-
-                contactCount += 1;
-            } else {
-                transducer->isTransducerActive =  false;
-                transducer->secondaryId = i;
-                transducer->previousCoordinates = transducer->currentCoordinates;
-                transducer->isPhysicalButtonDown = clickpadDown;
+    if (previous_thumb >= 0)
+        inputMessage.transducers[previous_thumb].fingerType =
+            static_cast<MT2FingerType>(kMT2FingerTypeIndexFinger + previous_thumb % 4);
+    previous_thumb = -1;
+    const bool suppress = suppressContacts(timestamp);
+    unsigned count = 0;
+    UInt32 lowest_y = 0;
+    int lowest = -1;
+    for (int i = 0; i < MAX_TOUCHES; ++i) {
+        auto& slot = inputMessage.transducers[i];
+        UInt32 x, y;
+        const bool active = !suppress && decode(i, x, y);
+        slot.isValid = active || slot.isTransducerActive || (slot.isValid && slot.isPhysicalButtonDown);
+        slot.isTransducerActive = active;
+        slot.isPhysicalButtonDown = click;
+        slot.previousCoordinates = slot.currentCoordinates;
+        slot.timestamp = timestamp;
+        if (active) {
+            slot.currentCoordinates.x = x;
+            slot.currentCoordinates.y = y;
+            ++count;
+            if (y >= lowest_y) {
+                lowest_y = y;
+                lowest = i;
             }
-
-
         }
-        // A one-button pad uses the multitouch click path. Discrete buttons
-        // use the relative-pointer path, without synthesizing a left click.
-        // Both ALPS devices share that VoodooInput endpoint, so retain each
-        // source independently until that source reports its own release.
-        pad_buttons = reportData.buttons & (u1_button_count == 1 ? 0x06 : 0x07);
-        spInputMessage.dx = 0;
-        spInputMessage.dy = 0;
-        spInputMessage.buttons = pad_buttons | stick_buttons;
-        spInputMessage.timestamp=timestamp;
-        // VoodooInput iterates this many array entries; contacts keep their hardware
-        // slot IDs, so active slots need not occupy the first contactCount entries.
-        inputMessage.contact_count = MAX_TOUCHES;
-        inputMessage.timestamp = timestamp;
-
-        if (contactCount >= 4 || clickpadDown) {
-            // simple thumb detection: to find the lowest finger touch in the vertical direction.
-            // All slots have to be looked at: the valid contacts are not necessarily the first contactCount ones.
-            UInt32 y_max = 0;
-            int thumb_index = -1;
-            for (int i = 0; i < MAX_TOUCHES; i++) {
-                VoodooInputTransducer* inputTransducer = &inputMessage.transducers[i];
-                if (inputTransducer->isTransducerActive && inputTransducer->currentCoordinates.y >= y_max) {
-                    y_max = inputTransducer->currentCoordinates.y;
-                    thumb_index = i;
-                }
-            }
-            if (thumb_index >= 0)
-                inputMessage.transducers[thumb_index].fingerType = kMT2FingerTypeThumb;
-        }
-
-
-        super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance, &inputMessage, sizeof(VoodooInputEvent));
-        super::messageClient(kIOMessageVoodooTrackpointRelativePointer,voodooInputInstance,&spInputMessage, sizeof(RelativePointerEvent));
-        return;
     }
-
-    if(report_id== U1_SP_ABSOLUTE_REPORT_ID){
-        if (!has_stick)
-            return;
-        u1_sp_input_report reportData = {};
-        // Same overflow as above (report->getLength() was used as the copy size). x and y are needed at least.
-        if (copyReport(report, &reportData, sizeof(reportData)) < offsetof(struct u1_sp_input_report, z))
-            return;
-#if DEBUG
-        IOLog("%s::%s Getting poked dx:%i, dy:%i \n", getName(), name, reportData.x, reportData.y);
-#endif
-        // Linux hid-alps uses signed little-endian deltas in eighths.
-        spInputMessage.dx = (SInt16)get_unaligned_le16(&reportData.x) / 8;
-        spInputMessage.dy = (SInt16)get_unaligned_le16(&reportData.y) / 8;
-        stick_buttons = reportData.buttons & 0x07;
-        spInputMessage.buttons = pad_buttons | stick_buttons;
-        spInputMessage.timestamp=timestamp;
-        super::messageClient(kIOMessageVoodooTrackpointRelativePointer,voodooInputInstance,&spInputMessage, sizeof(RelativePointerEvent));
-        return;
+    if (lowest >= 0 && (count >= 4 || click)) {
+        inputMessage.transducers[lowest].fingerType = kMT2FingerTypeThumb;
+        previous_thumb = lowest;
     }
-    return;
+    inputMessage.timestamp = timestamp;
+    event->touch = true;
+    event->contacts = inputMessage;
+    setPointerLocked(event, timestamp, 0, 0);
+}
 
+void AlpsHIDEventDriver::t4_raw_event(AbsoluteTime timestamp, const t4_input_report& report) {
+    touchEventLocked(timestamp, report.button, [&](int i, UInt32& x, UInt32& y) {
+        const auto& slot = report.contact[i];
+        x = (slot.x_hi << 8) | slot.x_lo;
+        if (!slot.palm || slot.palm >= 0x80 || x == 0xffff)
+            return false;
+        y = (slot.y_hi << 8) | slot.y_lo;
+        y = y < t4_y_min ? t4_y_min : (y > t4_y_max ? t4_y_max : y);
+        y = t4_y_max + t4_y_min - y;
+        return true;
+    });
+}
+
+void AlpsHIDEventDriver::u1_raw_event(AbsoluteTime timestamp, const u1_input_report& report) {
+    const bool clickpad = u1_button_count == 1;
+    pad_buttons = report.buttons & (clickpad ? 6 : 7);
+    touchEventLocked(timestamp, clickpad && (report.buttons & 1), [&](int i, UInt32& x, UInt32& y) {
+        const auto& slot = report.contact[i];
+        if (!(slot.z & 0x7f))
+            return false;
+        x = (slot.x_hi << 8) | slot.x_lo;
+        y = (slot.y_hi << 8) | slot.y_lo;
+        return true;
+    });
 }
 
 bool AlpsHIDEventDriver::u1_device_init() {
@@ -823,62 +806,64 @@ bool AlpsHIDEventDriver::u1_device_init() {
     if (ret != kIOReturnSuccess)
         goto exit;
 
-    // Read sensor geometry.
-    ret = u1_read_write_register(
-        ADDRESS_U1_NUM_SENS_X, &sen_line_num_x, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
+    if (!geometry_valid) {
+        // Read sensor geometry.
+        ret = u1_read_write_register(
+            ADDRESS_U1_NUM_SENS_X, &sen_line_num_x, 0, true);
+        if (ret != kIOReturnSuccess)
+            goto exit;
 
-    ret = u1_read_write_register(
-        ADDRESS_U1_NUM_SENS_Y, &sen_line_num_y, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
+        ret = u1_read_write_register(
+            ADDRESS_U1_NUM_SENS_Y, &sen_line_num_y, 0, true);
+        if (ret != kIOReturnSuccess)
+            goto exit;
 
-    ret = u1_read_write_register(
-        ADDRESS_U1_PITCH_SENS_X, &pitch_x, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
+        ret = u1_read_write_register(
+            ADDRESS_U1_PITCH_SENS_X, &pitch_x, 0, true);
+        if (ret != kIOReturnSuccess)
+            goto exit;
 
-    ret = u1_read_write_register(
-        ADDRESS_U1_PITCH_SENS_Y, &pitch_y, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
+        ret = u1_read_write_register(
+            ADDRESS_U1_PITCH_SENS_Y, &pitch_y, 0, true);
+        if (ret != kIOReturnSuccess)
+            goto exit;
 
-    ret = u1_read_write_register(
-        ADDRESS_U1_RESO_DWN_ABS, &resolution, 0, true);
-    if (ret != kIOReturnSuccess)
-        goto exit;
+        ret = u1_read_write_register(
+            ADDRESS_U1_RESO_DWN_ABS, &resolution, 0, true);
+        if (ret != kIOReturnSuccess)
+            goto exit;
 
-    // Reject invalid geometry before calculating coordinate ranges.
-    if (sen_line_num_x < 2 ||
-        sen_line_num_y < 2 ||
-        pitch_x == 0 ||
-        pitch_y == 0 ||
-        resolution == 0) {
-        IOLog(
-            "%s::%s Invalid U1 geometry: "
-            "sensors=%u,%u pitch=%u,%u resolution=%u\n",
-            getName(), name,
-            sen_line_num_x, sen_line_num_y,
-            pitch_x, pitch_y, resolution);
+        // Reject invalid geometry before calculating coordinate ranges.
+        if (sen_line_num_x < 2 ||
+            sen_line_num_y < 2 ||
+            pitch_x == 0 ||
+            pitch_y == 0 ||
+            resolution == 0) {
+            IOLog(
+                "%s::%s Invalid U1 geometry: "
+                "sensors=%u,%u pitch=%u,%u resolution=%u\n",
+                getName(), name,
+                sen_line_num_x, sen_line_num_y,
+                pitch_x, pitch_y, resolution);
 
-        ret = kIOReturnError;
-        goto exit;
+            ret = kIOReturnError;
+            goto exit;
+        }
+
+        pri_data.x_active_len_mm =
+            pitch_x * (sen_line_num_x - 1);
+
+        pri_data.y_active_len_mm =
+            pitch_y * (sen_line_num_y - 1);
+
+        pri_data.x_max =
+            (resolution << 2) * (sen_line_num_x - 1);
+        pri_data.x_min = 1;
+
+        pri_data.y_max =
+            (resolution << 2) * (sen_line_num_y - 1);
+        pri_data.y_min = 1;
     }
-
-    pri_data.x_active_len_mm =
-        pitch_x * (sen_line_num_x - 1);
-
-    pri_data.y_active_len_mm =
-        pitch_y * (sen_line_num_y - 1);
-
-    pri_data.x_max =
-        (resolution << 2) * (sen_line_num_x - 1);
-    pri_data.x_min = 1;
-
-    pri_data.y_max =
-        (resolution << 2) * (sen_line_num_y - 1);
-    pri_data.y_min = 1;
 
     // Read button configuration.
     ret = u1_read_write_register(
@@ -921,34 +906,71 @@ bool AlpsHIDEventDriver::u1_device_init() {
         }
     }
 
-    setProperty(
-        VOODOO_INPUT_LOGICAL_MAX_X_KEY,
-        pri_data.x_max, 32);
+    if (!geometry_valid) {
+        setProperty(
+            VOODOO_INPUT_LOGICAL_MAX_X_KEY,
+            pri_data.x_max, 32);
 
-    setProperty(
-        VOODOO_INPUT_LOGICAL_MAX_Y_KEY,
-        pri_data.y_max, 32);
+        setProperty(
+            VOODOO_INPUT_LOGICAL_MAX_Y_KEY,
+            pri_data.y_max, 32);
 
-    setProperty(
-        VOODOO_INPUT_PHYSICAL_MAX_X_KEY,
-        pri_data.x_active_len_mm * 10, 32);
+        setProperty(
+            VOODOO_INPUT_PHYSICAL_MAX_X_KEY,
+            pri_data.x_active_len_mm * 10, 32);
 
-    setProperty(
-        VOODOO_INPUT_PHYSICAL_MAX_Y_KEY,
-        pri_data.y_active_len_mm * 10, 32);
+        setProperty(
+            VOODOO_INPUT_PHYSICAL_MAX_Y_KEY,
+            pri_data.y_active_len_mm * 10, 32);
+    }
 
+    geometry_valid = ret == kIOReturnSuccess;
     u1_button_count = pri_data.btn_cnt;
     has_stick = pri_data.has_sp != 0;
     setReady(true);
     return true;
 
 exit:
+    geometry_valid = false;
     IOLog(
         "%s::%s U1 initialization failed: %d\n",
         getName(), name, ret);
 
     setReady(false);
     return false;
+}
+
+// Only the recovery work loop calls register I/O. getReport/setReport are
+// synchronous and the descriptor belongs to this device for its lifetime.
+IOReturn AlpsHIDEventDriver::exchangeFeature(UInt8 id, UInt8* bytes, size_t size, bool read) {
+    if (!feature_buffer) {
+        feature_buffer = new AlpsFeatureBuffer;
+        if (!feature_buffer || !feature_buffer->initWithPhysicalMask(kernel_task, kIODirectionInOut, size, 1, 0)) {
+            OSSafeReleaseNULL(feature_buffer);
+            return kIOReturnNoMemory;
+        }
+    }
+
+    feature_buffer->setLength(size);
+    auto* data = static_cast<UInt8*>(feature_buffer->getBytesNoCopy());
+    memcpy(data, bytes, size);
+    auto ret = hid_interface->setReport(feature_buffer, kIOHIDReportTypeFeature, id);
+    if (ret != kIOReturnSuccess || !read)
+        return ret;
+
+    feature_buffer->setLength(size);
+    bzero(data, size);
+    feature_buffer->beginReply();
+    ret = hid_interface->getReport(feature_buffer, kIOHIDReportTypeFeature, id);
+    if (ret != kIOReturnSuccess)
+        return ret;
+    // Some transports leave the descriptor length at capacity. Clearing the
+    // request first also catches empty replies and avoids reusing stale data.
+    unsigned needed = id == T4_FEATURE_REPORT_ID ? 15 : U1_FEATURE_REPORT_LEN;
+    if (!feature_buffer->covers(needed) || data[0] != id)
+        return kIOReturnIOError;
+    memcpy(bytes, data, needed);
+    return kIOReturnSuccess;
 }
 
 IOReturn AlpsHIDEventDriver::u1_read_write_register(
@@ -962,7 +984,6 @@ IOReturn AlpsHIDEventDriver::u1_read_write_register(
 
     UInt8 check_sum = 0;
     UInt8 input[U1_FEATURE_REPORT_LEN] = {};
-    UInt8 readbuf[U1_FEATURE_REPORT_LEN] = {};
 
     input[0] = U1_FEATURE_REPORT_ID;
 
@@ -982,49 +1003,9 @@ IOReturn AlpsHIDEventDriver::u1_read_write_register(
 
     input[7] = check_sum;
 
-    // Hand the bytes straight to the descriptor (no intermediate OSData copy)
-    IOBufferMemoryDescriptor* report =
-        IOBufferMemoryDescriptor::withBytes(
-            input, sizeof(input), kIODirectionInOut);
-
-    if (!report)
-        return kIOReturnNoMemory;
-
-    IOReturn ret = hid_interface->setReport(
-        report, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
-
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    if (read_flag) {
-        // Read into a fresh, zeroed descriptor (as Linux does with its own readbuf): reusing the
-        // request buffer made a short/empty reply return the request bytes as register data.
-        IOBufferMemoryDescriptor* response =
-            IOBufferMemoryDescriptor::withBytes(
-                readbuf, sizeof(readbuf), kIODirectionInOut);
-
-        if (!response) {
-            ret = kIOReturnNoMemory;
-            goto exit;
-        }
-
-        ret = hid_interface->getReport(
-            response, kIOHIDReportTypeFeature, U1_FEATURE_REPORT_ID);
-
-        if (ret == kIOReturnSuccess &&
-            response->readBytes(0, readbuf, sizeof(readbuf)) != sizeof(readbuf))
-            ret = kIOReturnError;
-
-        response->release();
-
-        if (ret != kIOReturnSuccess)
-            goto exit;
-
-        *read_val = readbuf[6];
-    }
-
-exit:
-    report->release();
+    auto ret = exchangeFeature(U1_FEATURE_REPORT_ID, input, sizeof(input), read_flag);
+    if (ret == kIOReturnSuccess && read_flag)
+        *read_val = input[6];
     return ret;
 }
 
@@ -1039,7 +1020,6 @@ IOReturn AlpsHIDEventDriver::t4_read_write_register(
 
     UInt16 check_sum = 0;
     UInt8 input[T4_FEATURE_REPORT_LEN] = {};
-    UInt8 readbuf[T4_FEATURE_REPORT_LEN] = {};
 
     input[0] = T4_FEATURE_REPORT_ID;
     input[1] = read_flag
@@ -1052,93 +1032,25 @@ IOReturn AlpsHIDEventDriver::t4_read_write_register(
     input[6] = 1;
     input[7] = 0;
 
-    check_sum = t4_calc_check_sum(input, 1, 8);
+    check_sum = t4_calc_check_sum(input + 1, 8);
     input[9] = (UInt8)check_sum;
     input[10] = (UInt8)(check_sum >> 8);
     input[11] = 0;
 
-    // Hand the bytes straight to the descriptor (no intermediate OSData copy)
-    IOBufferMemoryDescriptor* report =
-        IOBufferMemoryDescriptor::withBytes(
-            input, sizeof(input), kIODirectionInOut);
+    IOReturn ret = exchangeFeature(T4_FEATURE_REPORT_ID, input, sizeof(input), read_flag);
+    if (ret != kIOReturnSuccess || !read_flag)
+        return ret;
 
-    if (!report)
-        return kIOReturnNoMemory;
-
-    IOReturn ret = hid_interface->setReport(
-        report, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
-
-    if (ret != kIOReturnSuccess)
-        goto exit;
-
-    if (read_flag) {
-        // Read into a fresh, zeroed descriptor (as Linux does with its own readbuf): reusing the
-        // request buffer made a short/empty reply return the request bytes as register data.
-        IOBufferMemoryDescriptor* response =
-            IOBufferMemoryDescriptor::withBytes(
-                readbuf, sizeof(readbuf), kIODirectionInOut);
-
-        if (!response) {
-            ret = kIOReturnNoMemory;
-            goto exit;
-        }
-
-        ret = hid_interface->getReport(
-            response, kIOHIDReportTypeFeature, T4_FEATURE_REPORT_ID);
-
-        if (ret == kIOReturnSuccess &&
-            response->readBytes(0, readbuf, sizeof(readbuf)) != sizeof(readbuf))
-            ret = kIOReturnError;
-
-        response->release();
-
-        if (ret != kIOReturnSuccess)
-            goto exit;
-
-        UInt32 responseAddress =
-            (UInt32)readbuf[6] |
-            ((UInt32)readbuf[7] << 8) |
-            ((UInt32)readbuf[8] << 16) |
-            ((UInt32)readbuf[9] << 24);
-
-        if (responseAddress != address) {
-            IOLog("T4 register address mismatch "
-                  "(%x, %x)\n",
-                  responseAddress, address);
-            ret = kIOReturnError;
-            goto exit;
-        }
-
-        UInt16 responseSize = get_unaligned_le16(&readbuf[10]);
-
-        if (responseSize != 1) {
-            IOLog("T4 register size error (%x)\n",
-                  responseSize);
-            ret = kIOReturnError;
-            goto exit;
-        }
-
-        check_sum = t4_calc_check_sum(readbuf, 6, 7);
-
-        UInt16 responseChecksum =
-            get_unaligned_le16(&readbuf[13]);
-
-        if (responseChecksum != check_sum) {
-            IOLog("T4 register checksum error "
-                  "(%x, %x)\n",
-                  responseChecksum, check_sum);
-            ret = kIOReturnError;
-            goto exit;
-        }
-
-        *read_val = readbuf[12];
+    UInt32 responseAddress = (UInt32)input[6] | ((UInt32)input[7] << 8) |
+        ((UInt32)input[8] << 16) | ((UInt32)input[9] << 24);
+    if (responseAddress != address || get_unaligned_le16(input + 10) != 1 ||
+        get_unaligned_le16(input + 13) != t4_calc_check_sum(input + 6, 7)) {
+        IOLog("%s: invalid T4 reply for register %x\n", getName(), address);
+        return kIOReturnIOError;
     }
-
-exit:
-    report->release();
-    return ret;
+    *read_val = input[12];
+    return kIOReturnSuccess;
 }
-
 
 void AlpsHIDEventDriver::put_unaligned_le32(uint32_t val, void *p)
 {
@@ -1175,6 +1087,8 @@ bool AlpsHIDEventDriver::handleOpen(IOService *forClient, IOOptionBits options, 
             IOLockLock(input_lock);
         // A second open must not leak the first retain
         IOService* previous = voodooInputInstance;
+        if (previous != forClient)
+            sent_buttons = 0;
         voodooInputInstance = forClient;
         if (input_lock)
             IOLockUnlock(input_lock);
